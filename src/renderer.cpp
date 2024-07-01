@@ -5,51 +5,15 @@ module;
 //#include <vulkan/vulkan.h>
 #include <VkBootstrap.h>
 #include <vector>
-#include <GLFW/glfw3.h>
 #include <stdexcept>
 #include <cstring>
 #include <utility>
 
 export module renderer;
 
+import window_handles;
+
 namespace renderer {
-    export enum class WindowPlatform : uint8_t{
-        WINDOWS,
-        WAYLAND,
-        XLIB,
-        XCB,
-    };
-
-    export struct Win32Handles{
-        void *hwnd;
-        void *hinstance;
-    };
-
-    export struct XCBHandles{
-        void *connection;
-        uint32_t window;
-    };
-
-    export struct XlibHandles{
-        void *display;
-        unsigned long window;
-    };
-
-    export struct WaylandHandles{
-        void *display, *surface;
-    };
-
-    export struct WindowHandles{
-        WindowPlatform platform;
-        union{
-            Win32Handles win32_h;
-            XCBHandles xcb_h;
-            XlibHandles xlib_h;
-            WaylandHandles wayland_h;
-        }data;
-    };
-
-
 
     export class RenderInstance{
         public:
@@ -96,6 +60,27 @@ namespace renderer {
 
     // TODO: init surface with instance and windowhandle info
 
+    vkb::Instance make_instance_wh(const WindowHandles &wh, bool validation_layers){
+        vkb::InstanceBuilder builder;
+
+        const char*const instance_extensions[] = {
+            VK_KHR_SURFACE_EXTENSION_NAME,
+            windowhandles_get_vk_extension(&wh)
+        };
+
+        auto inst_ret = builder.set_app_name("cool vulkan app")
+            .enable_extensions(2,instance_extensions)
+            .request_validation_layers(validation_layers)
+            .use_default_debug_messenger()
+            .require_api_version(1,3,0)
+            .build();
+
+        if (!inst_ret.has_value()){
+            throw std::runtime_error{inst_ret.error().message()};
+        }
+        return inst_ret.value();
+    }
+
     export class RenderContext{
 
         VkInstance instance = VK_NULL_HANDLE;
@@ -111,21 +96,16 @@ namespace renderer {
         std::vector<VkImage> swp_images;
         std::vector<VkImageView> swp_image_views;
 
+        RenderContext() = default;
+
+
         public:
 
-        RenderContext(GLFWwindow *window, uint32_t width, uint32_t height, bool validation_layers){ // TODO: remove dependency on glfw
-            vkb::InstanceBuilder builder;
-
-            auto inst_ret = builder.set_app_name("cool vulkan app")
-                .request_validation_layers(validation_layers)
-                .use_default_debug_messenger()
-                .require_api_version(1,3,0)
-                .build();
-
-            vkb::Instance vkb_instance = inst_ret.value(); // may throw
+        static RenderContext make(const WindowHandles &wh, uint32_t width, uint32_t height, bool validation_layers){ 
+            vkb::Instance vkb_instance = make_instance_wh(wh, validation_layers); // may throw
                                                    
             VkSurfaceKHR surface;
-            VkResult err = glfwCreateWindowSurface(vkb_instance.instance,window,nullptr,&surface);
+            VkResult err = windowhandles_create_surface(vkb_instance.instance,&wh,&surface);
             if(err!=VK_SUCCESS){
                 throw std::runtime_error("failed to create surface");
             }
@@ -185,17 +165,21 @@ namespace renderer {
                 .build()
                 .value();
 
-            this->instance = vkb_instance.instance;
-            this->debug_messenger = vkb_instance.debug_messenger;
-            this->surface = surface;
-            this->phys_dev = physicalDevice.physical_device;
-            this->dev = vkbDevice.device;
-            this->format = swp_format;
+            RenderContext ctx{};
 
-            this->swp_extent = vkbSwapchain.extent;
-            this->swapchain = vkbSwapchain.swapchain;
-            this->swp_images = vkbSwapchain.get_images().value();
-            this->swp_image_views = vkbSwapchain.get_image_views().value();
+            ctx.instance = vkb_instance.instance;
+            ctx.debug_messenger = vkb_instance.debug_messenger,
+            ctx.surface = surface;
+            ctx.phys_dev = physicalDevice.physical_device;
+            ctx.dev = vkbDevice.device;
+            ctx.format = swp_format;
+
+            ctx.swp_extent = vkbSwapchain.extent;
+            ctx.swapchain = vkbSwapchain.swapchain;
+            ctx.swp_images = vkbSwapchain.get_images().value();
+            ctx.swp_image_views = vkbSwapchain.get_image_views().value();
+
+            return ctx;
         }
 
         ~RenderContext(){
@@ -208,7 +192,7 @@ namespace renderer {
                 vkDestroySurfaceKHR(this->instance, this->surface, nullptr);
                 vkDestroyDevice(this->dev,nullptr);
 
-                vkb::destroy_debug_utils_messenger(this->instance, this->debug_messenger);
+                //vkb::destroy_debug_utils_messenger(this->instance, this->debug_messenger);
                 vkDestroyInstance(this->instance, nullptr);
             }
         }

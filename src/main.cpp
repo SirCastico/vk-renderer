@@ -1,37 +1,103 @@
 //#include <VkBootstrap.h>
-#include <GLFW/glfw3.h>
+
+import renderer;
+import window_handles;
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_syswm.h>
+
+#include <stdexcept>
+#include <chrono>
+#include <thread>
+
 #include <cstdint>
 #include <cstdio>
 
-import renderer;
+
+WindowHandles get_sdl2_window_handles(SDL_Window *window){
+
+    SDL_SysWMinfo wm_info;
+    SDL_VERSION(&wm_info.version);
+    if(!SDL_GetWindowWMInfo(window, &wm_info)){
+        throw std::runtime_error{"failed to get window info"};
+    }
+    const char*const video_driver = SDL_GetCurrentVideoDriver();
+
+    if(strcmp(video_driver, "x11")==0){
+        return WindowHandles{
+            .platform = WH_XLIB,
+            .data = {
+                .xlib_h = {
+                    .display = wm_info.info.x11.display,
+                    .window = wm_info.info.x11.window,
+                }
+            }
+        };
+    } else if(strcmp(video_driver, "wayland")==0){
+        return WindowHandles{
+            .platform = WH_WAYLAND,
+            .data = {
+                .wayland_h = {
+                    .display = wm_info.info.wl.display,
+                    .surface = wm_info.info.wl.surface,
+                }
+            }
+        };
+        
+    } else {
+        throw std::runtime_error{"no window handle"};
+    }
+}
 
 int main(){
-    glfwSetErrorCallback([](int error, const char* description){
-        std::fprintf(stderr, "Error: %s\n", description);
-    });
-
-
-    if(!glfwInit()){
-        std::fprintf(stderr, "glfw failed to init\n");
-        return 1;
-    }
+    SDL_Init(SDL_INIT_VIDEO);
 
     uint32_t width=800, height=600;
 
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    SDL_Window *window = SDL_CreateWindow(
+            "cool",
+            width,
+            height,
+            width,
+            height,
+            SDL_WINDOW_VULKAN
+    );
 
-    GLFWwindow *window = glfwCreateWindow(width, height, "cool window", nullptr, nullptr);
     if(!window){
-        std::fprintf(stderr, "glfw failed to create window\n");
+        std::fprintf(stderr, "failed to create window: %s\n", SDL_GetError());
         return 1;
     }
 
-    renderer::RenderContext ctx{window,width,height,true};
+    WindowHandles wh = get_sdl2_window_handles(window);
 
-    while(!glfwWindowShouldClose(window)){
-        glfwPollEvents();
+    auto ctx = renderer::RenderContext::make(wh,width,height,true);
+
+    bool quit=false,stop_rendering=false;
+    while(!quit){
+        SDL_Event event;
+        while(SDL_PollEvent(&event)){
+            switch (event.type) {
+            case SDL_QUIT:
+                quit=true;
+                break;
+            case SDL_WINDOWEVENT:
+                switch (event.window.event){
+                    case SDL_WINDOWEVENT_MINIMIZED:
+                        stop_rendering=true;
+                        break;
+                    case SDL_WINDOWEVENT_RESTORED:
+                        stop_rendering=false;
+                        break;
+                }
+                break;
+            }
+        }
+        if(stop_rendering){
+            std::puts("sleeping");
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 
-    glfwDestroyWindow(window);
-    glfwTerminate();
+    SDL_DestroyWindow(window);
+    SDL_Quit();
 }

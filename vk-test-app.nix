@@ -7,7 +7,7 @@
     vulkan-tools-lunarg,
     clang-tools,
     #vk-bootstrap,
-    glfw,
+    SDL2,
     xorg,
     wayland,
     wayland-protocols,
@@ -26,7 +26,7 @@ stdenv.mkDerivation {
         vulkan-headers
         vulkan-loader
         #vk-bootstrap
-        glfw
+        SDL2
         xorg.libXt 
         xorg.libX11 
         xorg.libXinerama
