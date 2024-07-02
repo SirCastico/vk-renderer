@@ -12,4 +12,4 @@ target_sources(test
             renderer.cpp
             window_handles.cpp)
 
-target_link_libraries(test PRIVATE Vulkan::Vulkan VkBootstrap SDL2)
+target_link_libraries(test PRIVATE Vulkan::Vulkan VkBootstrap SDL2::SDL2)
