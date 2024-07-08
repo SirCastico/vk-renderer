@@ -1,54 +1,9 @@
-module;
 
 #include <vulkan/vulkan_core.h>
 #include "window_handles_header.h"
+#include "window_handles.hpp"
 
 #define VKRETURNIF(res) if(res!=VK_SUCCESS) return res
-
-export module window_handles;
-
-
-export enum WindowPlatform : uint8_t{
-    WH_WINDOWS,
-    WH_WAYLAND,
-    WH_XLIB,
-    WH_XCB,
-};
-
-export struct Win32Handles{
-    void *hwnd;
-    void *hinstance;
-};
-
-export struct XCBHandles{
-    void *connection;
-    uint32_t window;
-};
-
-export struct XlibHandles{
-    void *display;
-    unsigned long window;
-};
-
-export struct WaylandHandles{
-    void *display, *surface;
-};
-
-export struct WindowHandles{
-    WindowPlatform platform;
-    union{
-        Win32Handles win32_h;
-        XCBHandles xcb_h;
-        XlibHandles xlib_h;
-        WaylandHandles wayland_h;
-    }data;
-};
-
-export const char*const windowhandles_get_vk_extension(const WindowHandles *h);
-
-export VkResult windowhandles_create_surface(VkInstance instance, const WindowHandles *handle, VkSurfaceKHR *out_surf);
-
-module :private;
 
 const char*const windowhandles_get_vk_extension(const WindowHandles *h){
     switch (h->platform) {

@@ -1,7 +1,6 @@
-//#include <VkBootstrap.h>
 
-import renderer;
-import window_handles;
+#include "renderer.hpp"
+#include "window_handles.hpp"
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
@@ -92,6 +91,7 @@ int main(){
                 break;
             }
         }
+        ctx.draw();
         if(stop_rendering){
             std::puts("sleeping");
             std::this_thread::sleep_for(std::chrono::milliseconds(50));

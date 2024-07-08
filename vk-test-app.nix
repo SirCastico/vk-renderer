@@ -27,6 +27,7 @@ stdenv.mkDerivation {
         vulkan-loader
         #vk-bootstrap
         SDL2
+        xorg.libXrandr 
         xorg.libXt 
         xorg.libX11 
         xorg.libXinerama
