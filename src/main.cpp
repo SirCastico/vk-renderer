@@ -1,5 +1,5 @@
 
-#include "renderer.hpp"
+#include "renderer.h"
 #include "window_handles.hpp"
 
 #include <SDL2/SDL.h>
@@ -69,7 +69,7 @@ int main(){
 
     WindowHandles wh = get_sdl2_window_handles(window);
 
-    auto ctx = renderer::RenderContext::make(wh,width,height,true);
+    auto *ctx = renderer_new(&wh,width,height,true);
 
     bool quit=false,stop_rendering=false;
     while(!quit){
@@ -91,13 +91,14 @@ int main(){
                 break;
             }
         }
-        ctx.draw();
+        renderer_draw(ctx);
         if(stop_rendering){
             std::puts("sleeping");
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 
+    renderer_destroy(ctx);
     SDL_DestroyWindow(window);
     SDL_Quit();
 }

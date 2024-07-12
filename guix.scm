@@ -8,6 +8,7 @@
         "vulkan-loader"
         "vulkan-headers"
         "vulkan-tools"
+        "vulkan-validationlayers"
         "neovim"
         "cmake"
         "ninja"
