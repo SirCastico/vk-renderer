@@ -9,6 +9,7 @@
         "vulkan-headers"
         "vulkan-tools"
         "vulkan-validationlayers"
+        "glslang"
         "neovim"
         "cmake"
         "ninja"

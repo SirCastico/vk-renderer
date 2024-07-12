@@ -7,93 +7,12 @@
 #include <cstdlib>
 #include <vulkan/vulkan_core.h>
 #include <VkBootstrap.h>
-#include <vector>
 #include <stdexcept>
 #include <cstring>
-#include <utility>
 
 void abort_msg(const char*msg){
     std::puts(msg);
     std::abort();
-}
-
-static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout cur_layout, VkImageLayout new_layout){
-
-    VkImageMemoryBarrier2 imageBarrier {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-
-    imageBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    imageBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-    imageBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    imageBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
-
-    imageBarrier.oldLayout = cur_layout;
-    imageBarrier.newLayout = new_layout;
-
-    VkImageAspectFlags aspectMask = 
-        (new_layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL) ?
-            VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-
-    imageBarrier.subresourceRange = {
-        .aspectMask = aspectMask,
-        .baseMipLevel = 0,
-        .levelCount = VK_REMAINING_MIP_LEVELS,
-        .baseArrayLayer = 0,
-        .layerCount = VK_REMAINING_ARRAY_LAYERS,
-    };
-    imageBarrier.image = image;
-
-    VkDependencyInfo depInfo {};
-    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    depInfo.pNext = nullptr;
-
-    depInfo.imageMemoryBarrierCount = 1;
-    depInfo.pImageMemoryBarriers = &imageBarrier;
-
-    vkCmdPipelineBarrier2(cmd, &depInfo);
-}
-
-
-VkSemaphoreSubmitInfo semaphore_submit_info(VkPipelineStageFlags2 stageMask, VkSemaphore semaphore)
-{
-    VkSemaphoreSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    submitInfo.pNext = nullptr;
-    submitInfo.semaphore = semaphore;
-    submitInfo.stageMask = stageMask;
-    submitInfo.deviceIndex = 0;
-    submitInfo.value = 1;
-
-    return submitInfo;
-}
-
-VkCommandBufferSubmitInfo command_buffer_submit_info(VkCommandBuffer cmd)
-{
-    VkCommandBufferSubmitInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    info.pNext = nullptr;
-    info.commandBuffer = cmd;
-    info.deviceMask = 0;
-
-    return info;
-}
-
-VkSubmitInfo2 submit_info(VkCommandBufferSubmitInfo* cmd, VkSemaphoreSubmitInfo* signalSemaphoreInfo,
-    VkSemaphoreSubmitInfo* waitSemaphoreInfo)
-{
-    VkSubmitInfo2 info = {};
-    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    info.pNext = nullptr;
-
-    info.waitSemaphoreInfoCount = waitSemaphoreInfo == nullptr ? 0 : 1;
-    info.pWaitSemaphoreInfos = waitSemaphoreInfo;
-
-    info.signalSemaphoreInfoCount = signalSemaphoreInfo == nullptr ? 0 : 1;
-    info.pSignalSemaphoreInfos = signalSemaphoreInfo;
-
-    info.commandBufferInfoCount = 1;
-    info.pCommandBufferInfos = cmd;
-
-    return info;
 }
 
 namespace vkinit{
@@ -310,6 +229,117 @@ namespace vkutils{
         }
     };
 
+    template<uint32_t LEN>
+    class DescriptorLayoutBuilder{
+        std::array<VkDescriptorSetLayoutBinding, LEN> arr;
+        DescriptorLayoutBuilder()=default;
+
+        public:
+        static DescriptorLayoutBuilder<1> make(VkDescriptorSetLayoutBinding b){
+            DescriptorLayoutBuilder<1> builder{};
+            builder.arr[0] = b;
+            return builder;
+        }
+        DescriptorLayoutBuilder<LEN+1> add_binding(VkDescriptorSetLayoutBinding b){
+            DescriptorLayoutBuilder<LEN+1> builder{};
+            std::memcpy(builder.arr, this->arr, sizeof(b)*LEN);
+            builder.arr[LEN+1] = b;
+            return builder;
+        }
+
+        VkDescriptorSetLayout build(VkDevice dev, void *pnext, VkDescriptorSetLayoutCreateFlags flags){
+            VkDescriptorSetLayoutCreateInfo info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            info.pNext = pnext;
+
+            info.pBindings = this->arr.data();
+            info.bindingCount = (uint32_t)this->arr.size();
+            info.flags = flags;
+
+            VkDescriptorSetLayout set;
+            VkResult res = vkCreateDescriptorSetLayout(dev, &info, nullptr, &set);
+            if(res!=VK_SUCCESS) abort_msg("failed to build descriptor set layout");
+            return set;
+        };
+    };
+
+    static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout cur_layout, VkImageLayout new_layout){
+
+        VkImageMemoryBarrier2 imageBarrier {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+
+        imageBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        imageBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        imageBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        imageBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+
+        imageBarrier.oldLayout = cur_layout;
+        imageBarrier.newLayout = new_layout;
+
+        VkImageAspectFlags aspectMask = 
+            (new_layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL) ?
+                VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+
+        imageBarrier.subresourceRange = {
+            .aspectMask = aspectMask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        imageBarrier.image = image;
+
+        VkDependencyInfo depInfo {};
+        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        depInfo.pNext = nullptr;
+
+        depInfo.imageMemoryBarrierCount = 1;
+        depInfo.pImageMemoryBarriers = &imageBarrier;
+
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
+
+
+    VkSemaphoreSubmitInfo semaphore_submit_info(VkPipelineStageFlags2 stageMask, VkSemaphore semaphore)
+    {
+        VkSemaphoreSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        submitInfo.pNext = nullptr;
+        submitInfo.semaphore = semaphore;
+        submitInfo.stageMask = stageMask;
+        submitInfo.deviceIndex = 0;
+        submitInfo.value = 1;
+
+        return submitInfo;
+    }
+
+    VkCommandBufferSubmitInfo command_buffer_submit_info(VkCommandBuffer cmd)
+    {
+        VkCommandBufferSubmitInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+        info.pNext = nullptr;
+        info.commandBuffer = cmd;
+        info.deviceMask = 0;
+
+        return info;
+    }
+
+    VkSubmitInfo2 submit_info(VkCommandBufferSubmitInfo* cmd, VkSemaphoreSubmitInfo* signalSemaphoreInfo,
+        VkSemaphoreSubmitInfo* waitSemaphoreInfo)
+    {
+        VkSubmitInfo2 info = {};
+        info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+        info.pNext = nullptr;
+
+        info.waitSemaphoreInfoCount = waitSemaphoreInfo == nullptr ? 0 : 1;
+        info.pWaitSemaphoreInfos = waitSemaphoreInfo;
+
+        info.signalSemaphoreInfoCount = signalSemaphoreInfo == nullptr ? 0 : 1;
+        info.pSignalSemaphoreInfos = signalSemaphoreInfo;
+
+        info.commandBufferInfoCount = 1;
+        info.pCommandBufferInfos = cmd;
+
+        return info;
+    }
 
     void copy_image_to_image(VkCommandBuffer cmd, VkImage source, VkImage destination, VkExtent2D srcSize, VkExtent2D dstSize)
     {
@@ -736,7 +766,7 @@ class RenderContext{
         res = vkBeginCommandBuffer(cmd_buffer, &cmd_info);
         if(res!=VK_SUCCESS) abort_msg("failed to begin command buffer");
 
-        transition_image(
+        vkutils::transition_image(
                 cmd_buffer,
                 this->draw_img.img,
                 VK_IMAGE_LAYOUT_UNDEFINED,
@@ -758,13 +788,13 @@ class RenderContext{
         //clear image
         vkCmdClearColorImage(cmd_buffer, this->draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
 
-        transition_image(cmd_buffer, this->draw_img.img,VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkutils::transition_image(cmd_buffer, this->draw_img.img,VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkutils::transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
         // TODO: decouple draw img and swapchain extents
         vkutils::copy_image_to_image(cmd_buffer, this->draw_img.img, this->swp_images[swp_img_ind] , this->draw_img_extent, this->swp_extent);
 
-        transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        vkutils::transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
         //finalize the command buffer (we can no longer add commands, but it can now be executed)
         res = vkEndCommandBuffer(cmd_buffer);
@@ -773,12 +803,12 @@ class RenderContext{
         //prepare the submission to the queue. 
         //we want to wait on the _presentSemaphore, as that semaphore is signaled when the swapchain is ready
         //we will signal the _renderSemaphore, to signal that rendering has finished
-        VkCommandBufferSubmitInfo cmdinfo = command_buffer_submit_info(cmd_buffer);	
+        VkCommandBufferSubmitInfo cmdinfo = vkutils::command_buffer_submit_info(cmd_buffer);	
         
-        VkSemaphoreSubmitInfo waitInfo = semaphore_submit_info(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,frame.swp_semaphore);
-        VkSemaphoreSubmitInfo signalInfo = semaphore_submit_info(VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, frame.render_semaphore);	
+        VkSemaphoreSubmitInfo waitInfo = vkutils::semaphore_submit_info(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,frame.swp_semaphore);
+        VkSemaphoreSubmitInfo signalInfo = vkutils::semaphore_submit_info(VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, frame.render_semaphore);	
         
-        VkSubmitInfo2 submit = submit_info(&cmdinfo,&signalInfo,&waitInfo);	
+        VkSubmitInfo2 submit = vkutils::submit_info(&cmdinfo,&signalInfo,&waitInfo);	
 
         //submit command buffer to the queue and execute it.
         // _renderFence will now block until the graphic commands finish execution
