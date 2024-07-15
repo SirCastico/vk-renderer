@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <optional>
+#include <span>
 #include <vulkan/vulkan_core.h>
 #include <VkBootstrap.h>
 #include <stdexcept>
@@ -230,24 +233,23 @@ namespace vkutils{
     };
 
     template<uint32_t LEN>
-    class DescriptorLayoutBuilder{
+    struct DescriptorLayoutBuilder{
         std::array<VkDescriptorSetLayoutBinding, LEN> arr;
         DescriptorLayoutBuilder()=default;
 
-        public:
-        static DescriptorLayoutBuilder<1> make(VkDescriptorSetLayoutBinding b){
+        constexpr static DescriptorLayoutBuilder<1> make(VkDescriptorSetLayoutBinding b){
             DescriptorLayoutBuilder<1> builder{};
             builder.arr[0] = b;
             return builder;
         }
-        DescriptorLayoutBuilder<LEN+1> add_binding(VkDescriptorSetLayoutBinding b){
+        constexpr DescriptorLayoutBuilder<LEN+1> add_binding(VkDescriptorSetLayoutBinding b){
             DescriptorLayoutBuilder<LEN+1> builder{};
             std::memcpy(builder.arr, this->arr, sizeof(b)*LEN);
-            builder.arr[LEN+1] = b;
+            builder.arr[LEN] = b;
             return builder;
         }
 
-        VkDescriptorSetLayout build(VkDevice dev, void *pnext, VkDescriptorSetLayoutCreateFlags flags){
+        constexpr VkDescriptorSetLayout build(VkDevice dev, void *pnext, VkDescriptorSetLayoutCreateFlags flags){
             VkDescriptorSetLayoutCreateInfo info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             info.pNext = pnext;
 
@@ -260,6 +262,23 @@ namespace vkutils{
             if(res!=VK_SUCCESS) abort_msg("failed to build descriptor set layout");
             return set;
         };
+    };
+
+    struct DescriptorAllocator{
+        struct PoolSizeRatio{
+            VkDescriptorType type;
+            float ratio;
+        };
+
+        VkDescriptorPool pool;
+
+        DescriptorAllocator(VkDevice device, uint32_t maxSets, std::span<PoolSizeRatio> poolRatios){
+            
+        }
+        void clear_descriptors(VkDevice device);
+        void destroy_pool(VkDevice device);
+
+        VkDescriptorSet allocate(VkDevice device, VkDescriptorSetLayout layout);
     };
 
     static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout cur_layout, VkImageLayout new_layout){
@@ -374,6 +393,52 @@ namespace vkutils{
 
         vkCmdBlitImage2(cmd, &blitInfo);
     }
+
+
+    std::optional<VkShaderModule> load_shader_module(
+            const char* filePath, VkDevice device){
+
+        // open the file. With cursor at the end
+        std::ifstream file(filePath, std::ios::ate | std::ios::binary);
+
+        if (!file.is_open()) {
+            return std::nullopt;
+        }
+
+        // find what the size of the file is by looking up the location of the cursor
+        // because the cursor is at the end, it gives the size directly in bytes
+        size_t fileSize = (size_t)file.tellg();
+
+        // spirv expects the buffer to be on uint32, so make sure to reserve a int
+        // vector big enough for the entire file
+        std::vector<uint32_t> buffer(fileSize / sizeof(uint32_t));
+
+        // put file cursor at beginning
+        file.seekg(0);
+
+        // load the entire file into the buffer
+        file.read((char*)buffer.data(), fileSize);
+
+        // now that the file is loaded into the buffer, we can close it
+        file.close();
+
+        // create a new shader module, using the buffer we loaded
+        VkShaderModuleCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        createInfo.pNext = nullptr;
+
+        // codeSize has to be in bytes, so multply the ints in the buffer by size of
+        // int to know the real size of the buffer
+        createInfo.codeSize = buffer.size() * sizeof(uint32_t);
+        createInfo.pCode = buffer.data();
+
+        // check that the creation goes well.
+        VkShaderModule shaderModule;
+        if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+            return std::nullopt;
+        }
+        return shaderModule;
+    }
 }
 
 class RenderContext{
@@ -399,10 +464,15 @@ class RenderContext{
     vkutils::ImageBAlloc img_allocator;
     vkutils::BoundImage draw_img;
     VkExtent2D draw_img_extent;
+    VkImageView draw_img_view;
 
     VkImage *swp_images;
     VkImageView *swp_image_views;
     uint32_t swp_img_num;
+
+    VkDescriptorPool desc_pool;
+    VkDescriptorSet desc_set;
+    VkDescriptorSetLayout desc_set_layout;
 
     static constexpr uint32_t FRAME_OVERLAP = 2;
     using FrameDataArray = std::array<FrameData, FRAME_OVERLAP>;
@@ -410,6 +480,8 @@ class RenderContext{
     FrameDataArray frames;
     uint64_t frame_count;
 
+    VkPipeline gradient_pipeline;
+    VkPipelineLayout gradient_pipeline_layout;
 
     FrameData& get_current_frame(){
         return this->frames[this->frame_count % FRAME_OVERLAP];
@@ -419,6 +491,7 @@ class RenderContext{
     RenderContext() = default;
 
     // TODO: allow surface to be created externally
+    // TODO: better error handling
 
     static RenderContext make(const WindowHandles &wh, uint32_t width, uint32_t height, bool validation_layers){ 
         vkb::InstanceBuilder builder;
@@ -547,8 +620,10 @@ class RenderContext{
             .depth = 1
         };
 
+        VkFormat img_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+
         VkImageCreateInfo img_cinfo = vkinit::image_create_info(
-                VK_FORMAT_R16G16B16A16_SFLOAT,
+                img_format,
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | 
                     VK_IMAGE_USAGE_STORAGE_BIT  |
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -566,6 +641,12 @@ class RenderContext{
                 draw_img_extent.width*draw_img_extent.height*8*2);
 
         vkutils::BoundImage bound_img = img_alloc.bind_image(vkb_device.device, draw_img);
+
+        VkImageViewCreateInfo img_view_info = vkinit::imageview_create_info(img_format, bound_img.img, VK_IMAGE_ASPECT_COLOR_BIT);
+
+        VkImageView draw_img_view;
+        err = vkCreateImageView(vkb_device, &img_view_info, nullptr, &draw_img_view);
+        if(err!=VK_SUCCESS)abort_msg("failed to create image view");
 
         // frame data
         FrameDataArray frames;
@@ -602,6 +683,102 @@ class RenderContext{
 
         }
 
+        // descriptors
+
+        VkDescriptorPool desc_pool;
+        constexpr uint32_t pool_sizes_len = 1;
+        VkDescriptorPoolSize pool_sizes[pool_sizes_len] = {
+            VkDescriptorPoolSize{
+                .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .descriptorCount = 10,
+            }
+        };
+
+        VkDescriptorPoolCreateInfo desc_pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = 32,
+            .poolSizeCount = pool_sizes_len,
+            .pPoolSizes = pool_sizes,
+        };
+
+        vkCreateDescriptorPool(
+            vkb_device.device,
+            &desc_pool_info, 
+            nullptr,
+            &desc_pool);
+
+        
+        VkDescriptorSetLayout desc_layout = vkutils::DescriptorLayoutBuilder<1>::make(VkDescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        }).build(vkb_device.device, nullptr, 0);
+
+
+        VkDescriptorSetAllocateInfo desc_alloc_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &desc_layout
+        };
+        VkDescriptorSet desc_set;
+        err = vkAllocateDescriptorSets(vkb_device, &desc_alloc_info, &desc_set);
+        if(err!=VK_SUCCESS) abort_msg("failed desc set alloc");
+
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        imgInfo.imageView = draw_img_view;
+        
+        VkWriteDescriptorSet drawImageWrite = {};
+        drawImageWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        drawImageWrite.pNext = nullptr;
+        
+        drawImageWrite.dstBinding = 0;
+        drawImageWrite.dstSet = desc_set;
+        drawImageWrite.descriptorCount = 1;
+        drawImageWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        drawImageWrite.pImageInfo = &imgInfo;
+
+        vkUpdateDescriptorSets(vkb_device, 1, &drawImageWrite, 0, nullptr);
+
+        // create pipeline
+        VkPipelineLayoutCreateInfo compute_layout{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .setLayoutCount = 1,
+            .pSetLayouts = &desc_layout,
+        };
+        VkPipelineLayout pipeline_layout;
+        err = vkCreatePipelineLayout(vkb_device, &compute_layout, nullptr, &pipeline_layout);
+        if(err!=VK_SUCCESS) abort_msg("failed create pipeline layout");
+
+        auto shader_opt = vkutils::load_shader_module("./shaders/gradient.comp.spv", vkb_device);
+        if(!shader_opt) abort_msg("failed to read compute shader");
+
+        VkShaderModule shader = shader_opt.value();
+
+        VkPipelineShaderStageCreateInfo stageinfo{};
+        stageinfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stageinfo.pNext = nullptr;
+        stageinfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stageinfo.module = shader;
+        stageinfo.pName = "main";
+
+        VkComputePipelineCreateInfo computePipelineCreateInfo{};
+        computePipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        computePipelineCreateInfo.pNext = nullptr;
+        computePipelineCreateInfo.layout = pipeline_layout;
+        computePipelineCreateInfo.stage = stageinfo;
+
+        VkPipeline pipeline;
+        err = vkCreateComputePipelines(vkb_device,VK_NULL_HANDLE,1,&computePipelineCreateInfo, nullptr, &pipeline);
+
+        vkDestroyShaderModule(vkb_device, shader, nullptr);
+
         RenderContext ctx{};
 
         ctx.instance = vkb_instance.instance;
@@ -622,9 +799,17 @@ class RenderContext{
         ctx.img_allocator = img_alloc;
         ctx.draw_img = bound_img;
         ctx.draw_img_extent = VkExtent2D{.width=width,.height=height};
+        ctx.draw_img_view = draw_img_view;
+
+        ctx.desc_pool = desc_pool;
+        ctx.desc_set = desc_set;
+        ctx.desc_set_layout = desc_layout;
 
         ctx.frames = frames;
         ctx.frame_count = 0;
+
+        ctx.gradient_pipeline = pipeline;
+        ctx.gradient_pipeline_layout = pipeline_layout;
 
         return ctx;
     }
@@ -637,6 +822,17 @@ class RenderContext{
             vkDestroySemaphore(this->dev, frame.render_semaphore, nullptr);
             vkDestroySemaphore(this->dev, frame.swp_semaphore, nullptr);
         }
+
+        vkDestroyImageView(this->dev, this->draw_img_view, nullptr);
+        this->draw_img.destroy(this->dev);
+        this->img_allocator.destroy(this->dev);
+
+        vkDestroyPipeline(this->dev, this->gradient_pipeline, nullptr);
+        vkDestroyPipelineLayout(this->dev, this->gradient_pipeline_layout, nullptr);
+
+        vkDestroyDescriptorPool(this->dev, this->desc_pool, nullptr);
+        vkDestroyDescriptorSetLayout(this->dev, this->desc_set_layout, nullptr);
+
         vkDestroySwapchainKHR(this->dev, this->swapchain, nullptr);
         for(int i=0;i<this->swp_img_num;++i){
             vkDestroyImageView(this->dev,this->swp_image_views[i],nullptr);
@@ -646,8 +842,6 @@ class RenderContext{
         delete[] this->swp_images;
         delete[] this->swp_image_views;
 
-        this->draw_img.destroy(this->dev);
-        this->img_allocator.destroy(this->dev);
 
         vkDestroyDevice(this->dev,nullptr);
         vkDestroySurfaceKHR(this->instance, this->surface, nullptr);
@@ -773,20 +967,35 @@ class RenderContext{
                 VK_IMAGE_LAYOUT_GENERAL);
 
         //make a clear-color from frame number. This will flash with a 120 frame period.
-        VkClearColorValue clearValue;
-        float flash = std::abs(std::sin(this->frame_count / 120.f));
-        clearValue = { { 0.0f, 0.0f, flash, 1.0f } };
+        //VkClearColorValue clearValue;
+        //float flash = std::abs(std::sin(this->frame_count / 120.f));
+        //clearValue = { { 0.0f, 0.0f, flash, 1.0f } };
 
-        VkImageSubresourceRange clearRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = VK_REMAINING_MIP_LEVELS,
-            .baseArrayLayer = 0,
-            .layerCount = VK_REMAINING_ARRAY_LAYERS,
-        };
+        //VkImageSubresourceRange clearRange = {
+        //    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        //    .baseMipLevel = 0,
+        //    .levelCount = VK_REMAINING_MIP_LEVELS,
+        //    .baseArrayLayer = 0,
+        //    .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        //};
 
-        //clear image
-        vkCmdClearColorImage(cmd_buffer, this->draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
+        ////clear image
+        //vkCmdClearColorImage(cmd_buffer, this->draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
+
+        vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->gradient_pipeline);
+        vkCmdBindDescriptorSets(
+            cmd_buffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            this->gradient_pipeline_layout,
+            0,1,
+            &this->desc_set,
+            0, nullptr);
+
+        vkCmdDispatch(
+            cmd_buffer, 
+            std::ceil(this->draw_img_extent.width / 16.0), 
+            std::ceil(this->draw_img_extent.height / 16.0),
+            1);
 
         vkutils::transition_image(cmd_buffer, this->draw_img.img,VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         vkutils::transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
