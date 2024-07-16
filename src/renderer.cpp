@@ -441,7 +441,7 @@ namespace vkutils{
     }
 }
 
-class RenderContext{
+struct RenderContext{
 
     struct FrameData{
         VkCommandPool cmd_pool;
@@ -465,6 +465,7 @@ class RenderContext{
     vkutils::BoundImage draw_img;
     VkExtent2D draw_img_extent;
     VkImageView draw_img_view;
+    static constexpr VkFormat draw_img_format = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     VkImage *swp_images;
     VkImageView *swp_image_views;
@@ -483,11 +484,13 @@ class RenderContext{
     VkPipeline gradient_pipeline;
     VkPipelineLayout gradient_pipeline_layout;
 
+    VkPipeline g_pipeline;
+    VkPipelineLayout g_pipeline_layout;
+
     FrameData& get_current_frame(){
         return this->frames[this->frame_count % FRAME_OVERLAP];
     }
 
-    public:
     RenderContext() = default;
 
     // TODO: allow surface to be created externally
@@ -620,10 +623,8 @@ class RenderContext{
             .depth = 1
         };
 
-        VkFormat img_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-
         VkImageCreateInfo img_cinfo = vkinit::image_create_info(
-                img_format,
+                RenderContext::draw_img_format,
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | 
                     VK_IMAGE_USAGE_STORAGE_BIT  |
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -642,7 +643,8 @@ class RenderContext{
 
         vkutils::BoundImage bound_img = img_alloc.bind_image(vkb_device.device, draw_img);
 
-        VkImageViewCreateInfo img_view_info = vkinit::imageview_create_info(img_format, bound_img.img, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkImageViewCreateInfo img_view_info = vkinit::imageview_create_info(
+                RenderContext::draw_img_format, bound_img.img, VK_IMAGE_ASPECT_COLOR_BIT);
 
         VkImageView draw_img_view;
         err = vkCreateImageView(vkb_device, &img_view_info, nullptr, &draw_img_view);
@@ -774,10 +776,96 @@ class RenderContext{
         computePipelineCreateInfo.layout = pipeline_layout;
         computePipelineCreateInfo.stage = stageinfo;
 
-        VkPipeline pipeline;
-        err = vkCreateComputePipelines(vkb_device,VK_NULL_HANDLE,1,&computePipelineCreateInfo, nullptr, &pipeline);
+        VkPipeline c_pipeline;
+        err = vkCreateComputePipelines(vkb_device,VK_NULL_HANDLE,1,&computePipelineCreateInfo, nullptr, &c_pipeline);
 
         vkDestroyShaderModule(vkb_device, shader, nullptr);
+
+        // create graphics pipeline
+        VkPipelineLayoutCreateInfo gpinfo{.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        VkPipelineLayout g_pipeline_layout;
+        err = vkCreatePipelineLayout(vkb_device, &gpinfo, nullptr, &g_pipeline_layout);
+        if(err!=VK_SUCCESS) abort_msg("failed create graphics pipeline layout");
+        
+        VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+        // Specify we will use triangle lists to draw geometry.
+        VkPipelineInputAssemblyStateCreateInfo input_assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        // Specify rasterization state.
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.cullMode  = VK_CULL_MODE_BACK_BIT;
+        raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        raster.lineWidth = 1.0f;
+
+        // Our attachment will write to all color channels, but no blending is enabled.
+        VkPipelineColorBlendAttachmentState blend_attachment{};
+        blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blend.attachmentCount = 1;
+        blend.pAttachments    = &blend_attachment;
+
+        // We will have one viewport and scissor box.
+        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewport.viewportCount = 1;
+        viewport.scissorCount  = 1;
+
+        // Disable all depth testing.
+        VkPipelineDepthStencilStateCreateInfo depth_stencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+        // No multisampling.
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        // Specify that these states will be dynamic, i.e. not part of pipeline state object.
+        std::array<VkDynamicState, 2> dynamics{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.pDynamicStates    = dynamics.data();
+        dynamic.dynamicStateCount = (uint32_t)dynamics.size();
+
+        // Load our SPIR-V shaders.
+        std::array<VkPipelineShaderStageCreateInfo, 2> shader_stages{};
+
+        // Vertex stage of the pipeline
+        shader_stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shader_stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+        shader_stages[0].module = vkutils::load_shader_module("shaders/triangle.vert.spv", vkb_device).value(); // may throw
+        shader_stages[0].pName  = "main";
+
+        // Fragment stage of the pipeline
+        shader_stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shader_stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shader_stages[1].module = vkutils::load_shader_module("shaders/triangle.frag.spv", vkb_device).value(); // may throw
+        shader_stages[1].pName  = "main";
+
+        // dynamic rendering
+        VkPipelineRenderingCreateInfo g_pip_render_info = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+            .colorAttachmentCount = 1,
+            .pColorAttachmentFormats = &RenderContext::draw_img_format,
+        };
+
+        VkGraphicsPipelineCreateInfo g_pipe_info{
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = (void*)&g_pip_render_info,
+            .stageCount = (uint32_t)shader_stages.size(),
+            .pStages = shader_stages.data(),
+            .pVertexInputState   = &vertex_input,
+            .pInputAssemblyState = &input_assembly,
+            .pViewportState      = &viewport,
+            .pRasterizationState = &raster,
+            .pMultisampleState   = &multisample,
+            .pDepthStencilState  = &depth_stencil,
+            .pColorBlendState    = &blend,
+            .pDynamicState       = &dynamic,
+            .layout = g_pipeline_layout,
+        };
+
+        VkPipeline g_pipeline;
+        vkCreateGraphicsPipelines(vkb_device, VK_NULL_HANDLE, 1, &g_pipe_info, nullptr, &g_pipeline);
 
         RenderContext ctx{};
 
@@ -808,8 +896,11 @@ class RenderContext{
         ctx.frames = frames;
         ctx.frame_count = 0;
 
-        ctx.gradient_pipeline = pipeline;
+        ctx.gradient_pipeline = c_pipeline;
         ctx.gradient_pipeline_layout = pipeline_layout;
+
+        ctx.g_pipeline = g_pipeline;
+        ctx.g_pipeline_layout = g_pipeline_layout;
 
         return ctx;
     }
@@ -829,6 +920,9 @@ class RenderContext{
 
         vkDestroyPipeline(this->dev, this->gradient_pipeline, nullptr);
         vkDestroyPipelineLayout(this->dev, this->gradient_pipeline_layout, nullptr);
+
+        vkDestroyPipeline(this->dev, this->g_pipeline, nullptr);
+        vkDestroyPipelineLayout(this->dev, this->g_pipeline_layout, nullptr);
 
         vkDestroyDescriptorPool(this->dev, this->desc_pool, nullptr);
         vkDestroyDescriptorSetLayout(this->dev, this->desc_set_layout, nullptr);
@@ -937,14 +1031,16 @@ class RenderContext{
 
 
         res = vkResetCommandPool(this->dev, frame.cmd_pool, 0);
+        if(res!=VK_SUCCESS) abort_msg("failed to reset command pool");
 
         // allocate the default command buffer that we will use for rendering
-        VkCommandBufferAllocateInfo cmdAllocInfo = {};
-        cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmdAllocInfo.pNext = nullptr;
-        cmdAllocInfo.commandPool = frame.cmd_pool;
-        cmdAllocInfo.commandBufferCount = 1;
-        cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        VkCommandBufferAllocateInfo cmdAllocInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .commandPool = frame.cmd_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
 
         VkCommandBuffer cmd_buffer;
         res = vkAllocateCommandBuffers(this->dev, &cmdAllocInfo, &cmd_buffer);
@@ -967,37 +1063,93 @@ class RenderContext{
                 VK_IMAGE_LAYOUT_GENERAL);
 
         //make a clear-color from frame number. This will flash with a 120 frame period.
-        //VkClearColorValue clearValue;
-        //float flash = std::abs(std::sin(this->frame_count / 120.f));
-        //clearValue = { { 0.0f, 0.0f, flash, 1.0f } };
+        VkClearColorValue clearValue;
+        float flash = std::abs(std::sin(this->frame_count / 120.f));
+        clearValue = { { 0.0f, 0.0f, flash, 1.0f } };
 
-        //VkImageSubresourceRange clearRange = {
-        //    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        //    .baseMipLevel = 0,
-        //    .levelCount = VK_REMAINING_MIP_LEVELS,
-        //    .baseArrayLayer = 0,
-        //    .layerCount = VK_REMAINING_ARRAY_LAYERS,
-        //};
+        VkImageSubresourceRange clearRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
 
-        ////clear image
-        //vkCmdClearColorImage(cmd_buffer, this->draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
+        //clear image
+        vkCmdClearColorImage(cmd_buffer, this->draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
 
-        vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->gradient_pipeline);
-        vkCmdBindDescriptorSets(
-            cmd_buffer,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            this->gradient_pipeline_layout,
-            0,1,
-            &this->desc_set,
-            0, nullptr);
+        // graphics
+        
+        vkutils::transition_image(
+                cmd_buffer,
+                this->draw_img.img,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                //VK_IMAGE_LAYOUT_GENERAL);
 
-        vkCmdDispatch(
-            cmd_buffer, 
-            std::ceil(this->draw_img_extent.width / 16.0), 
-            std::ceil(this->draw_img_extent.height / 16.0),
-            1);
+        VkRenderingAttachmentInfo color_att_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = this->draw_img_view,
+            .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE,
+        };
+        VkRenderingInfo render_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = VkRect2D{
+                .offset=VkOffset2D{0,0},
+                .extent=this->draw_img_extent,
+            },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color_att_info
+        };
 
-        vkutils::transition_image(cmd_buffer, this->draw_img.img,VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkCmdBeginRendering(cmd_buffer, &render_info);
+        
+        vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, this->g_pipeline);
+        VkViewport viewport = {
+            .x = 0,
+            .y = 0,
+            .width = (float)this->draw_img_extent.width,
+            .height = (float)this->draw_img_extent.height,
+            .minDepth = 0.f,
+            .maxDepth = 1.f,
+        };
+
+        vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
+
+        VkRect2D scissor = {};
+        scissor.offset.x = 0;
+        scissor.offset.y = 0;
+        scissor.extent.width = this->draw_img_extent.width;
+        scissor.extent.height = this->draw_img_extent.height;
+
+        vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
+
+        //launch a draw command to draw 3 vertices
+        vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
+
+        vkCmdEndRendering(cmd_buffer);
+
+        // compute
+        //vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->gradient_pipeline);
+        //vkCmdBindDescriptorSets(
+        //    cmd_buffer,
+        //    VK_PIPELINE_BIND_POINT_COMPUTE,
+        //    this->gradient_pipeline_layout,
+        //    0,1,
+        //    &this->desc_set,
+        //    0, nullptr);
+
+        //vkCmdDispatch(
+        //    cmd_buffer, 
+        //    std::ceil(this->draw_img_extent.width / 16.0), 
+        //    std::ceil(this->draw_img_extent.height / 16.0),
+        //    1);
+
+        // write to swapchain image
+        vkutils::transition_image(cmd_buffer, this->draw_img.img,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         vkutils::transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
         // TODO: decouple draw img and swapchain extents
@@ -1044,6 +1196,7 @@ class RenderContext{
         //increase the number of frames drawn
         this->frame_count++;
     }
+
 };
 
 
