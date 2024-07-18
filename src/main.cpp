@@ -5,6 +5,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
 
+#include <SDL_video.h>
 #include <stdexcept>
 #include <chrono>
 #include <thread>
@@ -59,7 +60,7 @@ int main(){
             height,
             width,
             height,
-            SDL_WINDOW_VULKAN
+            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE
     );
 
     if(!window){
@@ -95,6 +96,11 @@ int main(){
         if(stop_rendering){
             std::puts("sleeping");
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if(renderer_is_resize_req(ctx)){
+            int w,h;
+            SDL_GetWindowSize(window, &w, &h);
+            renderer_resize(ctx, w, h);
         }
     }
 

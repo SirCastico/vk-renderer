@@ -1,6 +1,7 @@
 #include "renderer.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -174,6 +175,8 @@ namespace vkutils{
         VkMemoryPropertyFlags properties;
     };
 
+    // TODO: check if its fine to share buffer and images in the same memory
+    // TODO: check if having the alloc own and be required to access images is useful
     struct ImageBAlloc{
         VkDeviceMemory dev_mem;
         VkDeviceSize cap, len;
@@ -199,36 +202,51 @@ namespace vkutils{
 
             return b;
         }
-       
-        BoundImage bind_image(VkDevice dev, VkImage img){
-            VkMemoryRequirements mem_req;
-            vkGetImageMemoryRequirements(dev, img, &mem_req);
 
+        bool can_allocate(VkMemoryRequirements req){
+            if(this->len>=this->cap) return false;
+
+
+            VkDeviceSize nlen = this->len%req.alignment==0 ?
+                this->len :
+                this->len + req.alignment - this->len % req.alignment;
+
+            if(nlen+req.size>=this->cap) return false;
+            return true;
+        }
+       
+        BoundImage bind_image(VkDevice dev, VkImage img, VkMemoryRequirements mem_req){
             if((mem_req.memoryTypeBits & this->properties)==0){
                 abort_msg("wrong memory"); // TODO
             }
 
-            VkDeviceSize offset = mem_req.alignment - this->len % mem_req.alignment;
+            VkDeviceSize nlen = this->len%mem_req.alignment==0 ?
+                this->len :
+                this->len + mem_req.alignment - this->len % mem_req.alignment;
 
-            if(this->len + offset + mem_req.size > this->cap){
+            if(nlen + mem_req.size > this->cap){
                 abort_msg("not enough memory"); // TODO
             }
 
-            vkBindImageMemory(dev, img, this->dev_mem, this->len+offset);
+            vkBindImageMemory(dev, img, this->dev_mem, nlen);
 
             BoundImage bimg = {
                 .img = img,
                 .size = mem_req.size,
-                .offset = this->len+offset,
+                .offset = nlen,
             };
 
-            this->len += offset + mem_req.size;
+            this->len = nlen + mem_req.size;
 
             return bimg;
         }
 
         void destroy(VkDevice dev){
             vkFreeMemory(dev, this->dev_mem, nullptr);
+        }
+
+        void reset(){
+            this->len = 0;
         }
     };
 
@@ -264,24 +282,7 @@ namespace vkutils{
         };
     };
 
-    struct DescriptorAllocator{
-        struct PoolSizeRatio{
-            VkDescriptorType type;
-            float ratio;
-        };
-
-        VkDescriptorPool pool;
-
-        DescriptorAllocator(VkDevice device, uint32_t maxSets, std::span<PoolSizeRatio> poolRatios){
-            
-        }
-        void clear_descriptors(VkDevice device);
-        void destroy_pool(VkDevice device);
-
-        VkDescriptorSet allocate(VkDevice device, VkDescriptorSetLayout layout);
-    };
-
-    static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout cur_layout, VkImageLayout new_layout){
+    void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout cur_layout, VkImageLayout new_layout){
 
         VkImageMemoryBarrier2 imageBarrier {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
 
@@ -443,6 +444,8 @@ namespace vkutils{
 
 struct RenderContext{
 
+    static constexpr uint64_t swap_img_acquire_nano_timeout = 7'000'000'000;
+
     struct FrameData{
         VkCommandPool cmd_pool;
         VkSemaphore swp_semaphore, render_semaphore;
@@ -461,15 +464,18 @@ struct RenderContext{
     VkExtent2D swp_extent;
     VkSurfaceFormatKHR format;
 
-    vkutils::ImageBAlloc img_allocator;
-    vkutils::BoundImage draw_img;
-    VkExtent2D draw_img_extent;
-    VkImageView draw_img_view;
-    static constexpr VkFormat draw_img_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-
     VkImage *swp_images;
     VkImageView *swp_image_views;
     uint32_t swp_img_num;
+    bool resize_requested=false;
+
+    vkutils::DeviceMemory dev_mem;
+
+    vkutils::ImageBAlloc img_allocator;
+    vkutils::BoundImage bound_draw_img;
+    VkExtent2D draw_img_extent;
+    VkImageView draw_img_view;
+    static constexpr VkFormat draw_img_format = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     VkDescriptorPool desc_pool;
     VkDescriptorSet desc_set;
@@ -479,7 +485,7 @@ struct RenderContext{
     using FrameDataArray = std::array<FrameData, FRAME_OVERLAP>;
 
     FrameDataArray frames;
-    uint64_t frame_count;
+    uint64_t frame_count=0;
 
     VkPipeline gradient_pipeline;
     VkPipelineLayout gradient_pipeline_layout;
@@ -495,6 +501,55 @@ struct RenderContext{
 
     // TODO: allow surface to be created externally
     // TODO: better error handling
+    
+
+    static vkb::Swapchain make_swapchain(VkPhysicalDevice phdevice, VkDevice device, VkSurfaceKHR surface, VkExtent2D extent){
+        vkb::SwapchainBuilder swapchainBuilder{ phdevice,device,surface };
+
+        VkSurfaceFormatKHR swp_format = { .format = VK_FORMAT_B8G8R8A8_UNORM, .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+
+        vkb::Swapchain vkbSwapchain = swapchainBuilder
+            .set_desired_format(swp_format)
+            //use vsync present mode
+            .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR) // vsync
+            .set_desired_extent(extent.width, extent.height)
+            .add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+            .build()
+            .value();
+
+        return vkbSwapchain;
+    }
+
+    static uint32_t swapchain_image_count(VkDevice device, VkSwapchainKHR swapchain){
+        uint32_t swp_image_count;
+        VkResult err = vkGetSwapchainImagesKHR(device, swapchain, &swp_image_count, NULL);
+        if(err!=VK_SUCCESS) abort_msg("failed to count swapchain images");
+        return swp_image_count;
+    }
+
+    static void get_swapchain_imgs(VkDevice device, VkSwapchainKHR swapchain, VkFormat image_format, uint32_t img_count, VkImage *image_out, VkImageView *image_views_out){
+        VkResult err = vkGetSwapchainImagesKHR(device, swapchain, &img_count, image_out);
+        if(err!=VK_SUCCESS) abort_msg("failed to read swapchain images");
+
+        for (size_t i = 0; i < img_count; i++)
+        {
+            // Create an image view which we can render into.
+            VkImageViewCreateInfo view_info={VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            view_info.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
+            view_info.format                      = image_format;
+            view_info.image                       = image_out[i];
+            view_info.subresourceRange.levelCount = 1;
+            view_info.subresourceRange.layerCount = 1;
+            view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            view_info.components.r                = VK_COMPONENT_SWIZZLE_R;
+            view_info.components.g                = VK_COMPONENT_SWIZZLE_G;
+            view_info.components.b                = VK_COMPONENT_SWIZZLE_B;
+            view_info.components.a                = VK_COMPONENT_SWIZZLE_A;
+
+            err = vkCreateImageView(device, &view_info, NULL, &image_views_out[i]);
+            if(err!=VK_SUCCESS) abort_msg("failed to create swapchain image view");
+        }
+    }
 
     static RenderContext make(const WindowHandles &wh, uint32_t width, uint32_t height, bool validation_layers){ 
         vkb::InstanceBuilder builder;
@@ -564,50 +619,14 @@ struct RenderContext{
         vkb::Device vkb_device = deviceBuilder.build().value();
 
         // Create swapchain
-        vkb::SwapchainBuilder swapchainBuilder{ physicalDevice,vkb_device,surface };
 
-        VkSurfaceFormatKHR swp_format = { .format = VK_FORMAT_B8G8R8A8_UNORM, .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+        vkb::Swapchain vkbSwapchain = RenderContext::make_swapchain(physicalDevice, vkb_device, surface, {.width=width,.height=height});
 
-        vkb::Swapchain vkbSwapchain = swapchainBuilder
-            .set_desired_format(swp_format)
-            //use vsync present mode
-            .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR) // vsync
-            .set_desired_extent(width, height)
-            .add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-            .build()
-            .value();
-
-        uint32_t swp_image_count;
-        err = vkGetSwapchainImagesKHR(vkb_device.device, vkbSwapchain.swapchain, &swp_image_count, NULL);
-        if(err!=VK_SUCCESS) abort_msg("failed to count swapchain images");
-
-        /// The swapchain images.
-        //VkImage *swp_images = (VkImage*)malloc(image_count*sizeof(VkImage));
+        uint32_t swp_image_count = RenderContext::swapchain_image_count(vkb_device, vkbSwapchain);
         VkImage *swp_images = new VkImage[swp_image_count];
-
-        err = vkGetSwapchainImagesKHR(vkb_device.device, vkbSwapchain.swapchain, &swp_image_count, swp_images);
-        if(err!=VK_SUCCESS) abort_msg("failed to read swapchain images");
-
         VkImageView *swp_image_views = new VkImageView[swp_image_count];
 
-        for (size_t i = 0; i < swp_image_count; i++)
-        {
-            // Create an image view which we can render into.
-            VkImageViewCreateInfo view_info={VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            view_info.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
-            view_info.format                      = vkbSwapchain.image_format;
-            view_info.image                       = swp_images[i];
-            view_info.subresourceRange.levelCount = 1;
-            view_info.subresourceRange.layerCount = 1;
-            view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            view_info.components.r                = VK_COMPONENT_SWIZZLE_R;
-            view_info.components.g                = VK_COMPONENT_SWIZZLE_G;
-            view_info.components.b                = VK_COMPONENT_SWIZZLE_B;
-            view_info.components.a                = VK_COMPONENT_SWIZZLE_A;
-
-            err = vkCreateImageView(vkb_device.device, &view_info, NULL, &swp_image_views[i]);
-            if(err!=VK_SUCCESS) abort_msg("failed to create swapchain image view");
-        }
+        RenderContext::get_swapchain_imgs(vkb_device, vkbSwapchain, vkbSwapchain.image_format, swp_image_count, swp_images, swp_image_views);
 
         VkQueue g_queue = vkb_device.get_queue(vkb::QueueType::graphics).value();
         uint32_t g_queue_fam = vkb_device.get_queue_index(vkb::QueueType::graphics).value();
@@ -618,8 +637,8 @@ struct RenderContext{
 
         // draw image
         VkExtent3D draw_img_extent = {
-            .width = width,
-            .height = height,
+            .width = vkbSwapchain.extent.width,
+            .height = vkbSwapchain.extent.height,
             .depth = 1
         };
 
@@ -635,13 +654,16 @@ struct RenderContext{
         VkImage draw_img;
         vkCreateImage(vkb_device.device, &img_cinfo, nullptr, &draw_img);
 
+        VkMemoryRequirements mem_req;
+        vkGetImageMemoryRequirements(vkb_device, draw_img, &mem_req);
+
         auto img_alloc = vkutils::ImageBAlloc::make(
                 vkb_device.device, 
                 dev_mem, 
                 vkutils::MemoryTypes::DEVICE_LOCAL, 
-                draw_img_extent.width*draw_img_extent.height*8*2);
+                mem_req.size);
 
-        vkutils::BoundImage bound_img = img_alloc.bind_image(vkb_device.device, draw_img);
+        vkutils::BoundImage bound_img = img_alloc.bind_image(vkb_device.device, draw_img, mem_req);
 
         VkImageViewCreateInfo img_view_info = vkinit::imageview_create_info(
                 RenderContext::draw_img_format, bound_img.img, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -651,7 +673,7 @@ struct RenderContext{
         if(err!=VK_SUCCESS)abort_msg("failed to create image view");
 
         // frame data
-        FrameDataArray frames;
+        FrameDataArray frames{};
 
         //create a command pool for commands submitted to the graphics queue.
         VkCommandPoolCreateInfo commandPoolInfo = {};
@@ -877,15 +899,18 @@ struct RenderContext{
         ctx.g_queue = g_queue;
         ctx.g_queue_fam = g_queue_fam;
 
-        ctx.format = swp_format;
+        ctx.format = {.format=vkbSwapchain.image_format,.colorSpace=vkbSwapchain.color_space};
         ctx.swp_extent = vkbSwapchain.extent;
         ctx.swapchain = vkbSwapchain.swapchain;
         ctx.swp_images = swp_images;
         ctx.swp_image_views = swp_image_views;
         ctx.swp_img_num = swp_image_count;
+        ctx.resize_requested = false;
+
+        ctx.dev_mem = dev_mem;
 
         ctx.img_allocator = img_alloc;
-        ctx.draw_img = bound_img;
+        ctx.bound_draw_img = bound_img;
         ctx.draw_img_extent = VkExtent2D{.width=width,.height=height};
         ctx.draw_img_view = draw_img_view;
 
@@ -915,7 +940,7 @@ struct RenderContext{
         }
 
         vkDestroyImageView(this->dev, this->draw_img_view, nullptr);
-        this->draw_img.destroy(this->dev);
+        this->bound_draw_img.destroy(this->dev);
         this->img_allocator.destroy(this->dev);
 
         vkDestroyPipeline(this->dev, this->gradient_pipeline, nullptr);
@@ -944,91 +969,110 @@ struct RenderContext{
         vkDestroyInstance(this->instance, nullptr);
     }
 
-    //~RenderContext(){
-    //    if(this->instance != VK_NULL_HANDLE){
-    //        for(auto& frame : this->frames){
-    //            vkDestroyCommandPool(this->dev, frame.cmd_pool, nullptr);
-    //            vkDestroyFence(this->dev, frame.render_fence, nullptr);
-    //            vkDestroySemaphore(this->dev, frame.render_semaphore, nullptr);
-    //            vkDestroySemaphore(this->dev, frame.swp_semaphore, nullptr);
-    //        }
-    //        vkDestroySwapchainKHR(this->dev, this->swapchain, nullptr);
-    //        for(int i=0;i<this->swp_img_num;++i){
-    //            vkDestroyImageView(this->dev,this->swp_image_views[i],nullptr);
-    //            vkDestroyImage(this->dev, this->swp_images[i],nullptr);
-    //        }
+    void resize_swapchain(uint32_t width, uint32_t height){
+        //vkDeviceWaitIdle(this->dev);
+        vkQueueWaitIdle(this->g_queue); // TODO: is this fine?
 
-    //        vkDestroyDevice(this->dev,nullptr);
-    //        vkDestroySurfaceKHR(this->instance, this->surface, nullptr);
+        vkDestroySwapchainKHR(this->dev, this->swapchain, nullptr);
+        for(int i=0;i<this->swp_img_num;++i){
+            vkDestroyImageView(this->dev,this->swp_image_views[i],nullptr);
+        }
 
-    //        vkb::destroy_debug_utils_messenger(this->instance, this->debug_messenger);
-    //        vkDestroyInstance(this->instance, nullptr);
-    //    }
-    //}
+        vkb::Swapchain vkb_swap = RenderContext::make_swapchain(this->phys_dev, this->dev, this->surface, {width,height});
 
-    //RenderContext(RenderContext&& other) :
-    //        instance(other.instance),
-    //        debug_messenger(other.debug_messenger),
-    //        surface(other.surface),
-    //        phys_dev(other.phys_dev),
-    //        dev(other.dev),
-    //        g_queue(other.g_queue),
-    //        g_queue_fam(other.g_queue_fam),
-    //        swapchain(other.swapchain),
-    //        swp_extent(other.swp_extent),
-    //        format(other.format),
-    //        swp_images(std::move(other.swp_images)),
-    //        swp_image_views(std::move(other.swp_image_views)),
-    //        frames(other.frames),
-    //        frame_count(other.frame_count)
-    //{
-    //    other.instance = VK_NULL_HANDLE;
-    //}
+        uint32_t img_count = RenderContext::swapchain_image_count(this->dev, vkb_swap);
+        if(img_count != this->swp_img_num) abort_msg("img count different"); // TODO: is this fine?
 
-    //RenderContext& operator=(RenderContext&& other){
-    //    this->instance = other.instance;
-    //    this->debug_messenger = other.debug_messenger;
-    //    this->surface = other.surface;
-    //    this->phys_dev = other.phys_dev;
-    //    this->dev = other.dev;
-    //    this->g_queue = other.g_queue;
-    //    this->g_queue_fam = other.g_queue_fam;
-    //
-    //    this->swapchain = other.swapchain;
-    //    this->swp_extent = other.swp_extent;
-    //    this->format = other.format;
+        RenderContext::get_swapchain_imgs(this->dev, vkb_swap, vkb_swap.image_format, img_count, this->swp_images, this->swp_image_views);
 
-    //    this->swp_images = std::move(other.swp_images);
-    //    this->swp_image_views = std::move(other.swp_image_views);
+        this->swapchain = vkb_swap.swapchain;
+        this->swp_img_num = img_count;
+        this->format = {vkb_swap.image_format, vkb_swap.color_space};
+        this->swp_extent = vkb_swap.extent;
 
-    //    this->frames = other.frames;
-    //    this->frame_count = other.frame_count;
+        // recreate draw_img
 
-    //    other.instance = VK_NULL_HANDLE;
-    //    return *this;
-    //}
+        vkDestroyImageView(this->dev, this->draw_img_view, nullptr);
+        this->bound_draw_img.destroy(this->dev);
+        this->img_allocator.reset();
 
-    //RenderContext(const RenderContext&) = delete;
+        VkExtent3D draw_img_extent = {
+            .width = vkb_swap.extent.width,
+            .height = vkb_swap.extent.height,
+            .depth = 1
+        };
 
-    //RenderContext& operator=(const RenderContext&) = delete;
+        VkImageCreateInfo img_cinfo = vkinit::image_create_info(
+                RenderContext::draw_img_format,
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | 
+                    VK_IMAGE_USAGE_STORAGE_BIT  |
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                draw_img_extent        
+        );
+
+        VkImage draw_img;
+        vkCreateImage(this->dev, &img_cinfo, nullptr, &draw_img);
+
+        VkMemoryRequirements mem_req;
+        vkGetImageMemoryRequirements(this->dev, draw_img, &mem_req);
+
+        if(!this->img_allocator.can_allocate(mem_req)){
+            fprintf(stderr, "reallocating image\n");
+            this->img_allocator.destroy(this->dev);
+            this->img_allocator = vkutils::ImageBAlloc::make(
+                    this->dev, 
+                    this->dev_mem, 
+                    vkutils::MemoryTypes::DEVICE_LOCAL, 
+                    mem_req.size);
+        }
+        
+        this->bound_draw_img =
+            this->img_allocator.bind_image(this->dev, draw_img, mem_req);
+
+        VkImageViewCreateInfo img_view_info = vkinit::imageview_create_info(
+                RenderContext::draw_img_format, draw_img, VK_IMAGE_ASPECT_COLOR_BIT);
+
+        VkResult err = vkCreateImageView(this->dev, &img_view_info, nullptr, &this->draw_img_view);
+        if(err!=VK_SUCCESS)abort_msg("failed to create image view");
+
+        this->draw_img_extent = {draw_img_extent.width, draw_img_extent.height};
+
+        this->resize_requested = false;
+    }
 
     void draw(){
+        printf("frame: %ld\n", this->frame_count);
+        if(this->resize_requested) return;
+
         FrameData &frame = this->get_current_frame();
         VkResult res = vkWaitForFences(this->dev, 1, &frame.render_fence, true, 1000000000);
-        if(res!=VK_SUCCESS) abort_msg("failed wait for fence");
-        res = vkResetFences(this->dev, 1, &frame.render_fence);
-        if(res!=VK_SUCCESS) abort_msg("failed fence reset");
+        if (res==VK_TIMEOUT){
+            abort_msg("timedout frame fence");
+        } else if(res!=VK_SUCCESS) abort_msg("failed wait for fence");
 
         uint32_t swp_img_ind;
         res = vkAcquireNextImageKHR(
                 this->dev, 
                 this->swapchain, 
-                1000000000, 
+                RenderContext::swap_img_acquire_nano_timeout, 
                 frame.swp_semaphore,
                 nullptr,
                 &swp_img_ind);
-        if(res!=VK_SUCCESS) abort_msg("failed img acquire");
+        if(res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_SUBOPTIMAL_KHR){
+            puts("acquire img request resize");
+            this->resize_requested = true;
+            return;
+        } else if(res==VK_TIMEOUT){
+            abort_msg("img acquire timedout");
+        } else if(res==VK_NOT_READY){
+            abort_msg("img acquire not ready");
+        } else if(res!=VK_SUCCESS) {
+            abort_msg("failed img acquire");
+        }
 
+        res = vkResetFences(this->dev, 1, &frame.render_fence);
+        if(res!=VK_SUCCESS) abort_msg("failed fence reset");
 
         res = vkResetCommandPool(this->dev, frame.cmd_pool, 0);
         if(res!=VK_SUCCESS) abort_msg("failed to reset command pool");
@@ -1058,7 +1102,7 @@ struct RenderContext{
 
         vkutils::transition_image(
                 cmd_buffer,
-                this->draw_img.img,
+                this->bound_draw_img.img,
                 VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_GENERAL);
 
@@ -1076,13 +1120,13 @@ struct RenderContext{
         };
 
         //clear image
-        vkCmdClearColorImage(cmd_buffer, this->draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
+        vkCmdClearColorImage(cmd_buffer, this->bound_draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
 
         // graphics
         
         vkutils::transition_image(
                 cmd_buffer,
-                this->draw_img.img,
+                this->bound_draw_img.img,
                 VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 //VK_IMAGE_LAYOUT_GENERAL);
@@ -1149,11 +1193,11 @@ struct RenderContext{
         //    1);
 
         // write to swapchain image
-        vkutils::transition_image(cmd_buffer, this->draw_img.img,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkutils::transition_image(cmd_buffer, this->bound_draw_img.img,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         vkutils::transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
         // TODO: decouple draw img and swapchain extents
-        vkutils::copy_image_to_image(cmd_buffer, this->draw_img.img, this->swp_images[swp_img_ind] , this->draw_img_extent, this->swp_extent);
+        vkutils::copy_image_to_image(cmd_buffer, this->bound_draw_img.img, this->swp_images[swp_img_ind] , this->draw_img_extent, this->swp_extent);
 
         vkutils::transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
@@ -1191,7 +1235,11 @@ struct RenderContext{
 
         presentInfo.pImageIndices = &swp_img_ind;
         res = vkQueuePresentKHR(this->g_queue, &presentInfo);
-        if(res!=VK_SUCCESS) abort_msg("failed to present");
+        if(res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_SUBOPTIMAL_KHR){
+            puts("present request resize");
+            this->resize_requested = true;
+            return;
+        } else if(res!=VK_SUCCESS) abort_msg("failed to present");
 
         //increase the number of frames drawn
         this->frame_count++;
@@ -1208,6 +1256,14 @@ extern "C" RenderContext *renderer_new(const WindowHandles *wh, uint32_t width, 
 
 extern "C" void renderer_draw(RenderContext *ctx){
     ctx->draw();
+}
+
+extern "C" bool renderer_is_resize_req(RenderContext *ctx){
+    return ctx->resize_requested;
+}
+
+extern "C" void renderer_resize(RenderContext *ctx, uint32_t width, uint32_t height){
+    ctx->resize_swapchain(width, height);
 }
 
 extern "C" void renderer_destroy(RenderContext* ctx){

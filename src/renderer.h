@@ -13,6 +13,10 @@ RenderContext* renderer_new(const WindowHandles *wh, uint32_t width, uint32_t he
 
 void renderer_draw(RenderContext*);
 
+void renderer_resize(RenderContext *ctx, uint32_t width, uint32_t height);
+
+bool renderer_is_resize_req(RenderContext *ctx);
+
 void renderer_destroy(RenderContext*);
 
 
