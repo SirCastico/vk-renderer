@@ -1,0 +1,90 @@
+//GLSL version to use
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+//size of a workgroup for compute, specialization constants can be used
+layout (local_size_x = 32) in;
+
+//descriptor bindings for the pipeline
+layout(rgba16f,set = 0, binding = 0) uniform image2D image;
+
+struct AABB{
+    vec3 min,max;
+};
+
+struct MeshData{
+    AABB aabb;
+    uint verts_start_i, len;
+};
+
+struct Vertex{
+    vec3 pos;
+};
+
+layout(buffer_reference, std430, buffer_reference_align=8) readonly buffer MeshDataBuffer{
+    uint size;
+    MeshData meshes[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align=8) readonly buffer MeshVertexBuffer{
+    uint size;
+    vec3 vertices[];
+};
+
+layout(push_constant, std430) uniform Data{
+    mat4 cam;
+    MeshDataBuffer mesh_data_ref;
+    MeshVertexBuffer mesh_vertices_ref;
+    float fov_tan;
+}data;
+
+
+bool ray_aabb_collision(AABB aabb, vec4 origin, vec4 dir){
+    const float tx1 = (aabb.min.x - origin.x) / dir.x;
+    const float tx2 = (aabb.max.x - origin.x) / dir.x;
+
+    float tmin = min(tx1,tx2);
+    float tmax = max(tx1,tx2);
+
+    float ty1 = (aabb.min.y - origin.y) / dir.y;
+    float ty2 = (aabb.max.y - origin.y) / dir.y;
+
+    tmin = max(tmin,min(ty1,ty2));
+    tmin = min(tmin,max(ty1,ty2));
+
+    float tz1 = (aabb.min.z - origin.z) / dir.z;
+    float tz2 = (aabb.max.z - origin.z) / dir.z;
+
+    tmin = max(tmin,min(tz1,tz2));
+    tmin = min(tmin,max(tz1,tz2));
+
+    return tmax>=tmin;
+}
+
+vec4 render(vec4 origin, vec4 dir){
+    vec4 color = vec4(0.0,0.0,1.0,1.0);
+    for(uint mesh_i=0;mesh_i<data.mesh_data_ref.size;++mesh_i){
+        if(ray_aabb_collision(data.mesh_data_ref.meshes[mesh_i].aabb, origin, dir)){
+            color = vec4(1.0,0.0,0.0,1.0);
+            break;
+        }
+    }
+    return color;
+}
+
+void main() {
+    ivec2 image_size = imageSize(image);
+    vec2 texel_coord = vec2(gl_GlobalInvocationID.xy);
+    float aspect_ratio = float(image_size.x)/float(image_size.y);
+
+    float px = (2.0*((texel_coord.x+0.5)/image_size.x)-1.0) * data.fov_tan * aspect_ratio;
+    float py = (1.0-2.0*((texel_coord.y+0.5)/image_size.y)) * data.fov_tan;
+
+    //vec4 ray_origin = vec4(0.0,0.0,0.0,1.0) * data.cam;
+    //vec4 ray_dir = normalize(vec4(px,py,-1.0,0.0)) * data.cam;
+    //ray_dir = normalize(ray_dir);
+    //
+    //vec4 color = render(ray_origin,ray_dir);
+
+    imageStore(image, ivec2(gl_GlobalInvocationID.xy), vec4(1.0,0.0,0.0,1.0));
+}

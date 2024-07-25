@@ -15,4 +15,4 @@ add_executable(test main.cpp window_handles.cpp renderer.cpp)
 
 target_link_libraries(
     test PRIVATE 
-        Vulkan::Vulkan VkBootstrap SDL2::SDL2)
+        Vulkan::Vulkan VkBootstrap SDL2::SDL2 cgltf HandmadeMath)

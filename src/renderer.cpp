@@ -1,22 +1,30 @@
 #include "renderer.h"
 
 #include <array>
-#include <chrono>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <numbers>
 #include <optional>
-#include <span>
+#include <vector>
 #include <vulkan/vulkan_core.h>
 #include <VkBootstrap.h>
-#include <stdexcept>
 #include <cstring>
+#include <cgltf.h>
+#include <HandmadeMath.h>
 
 void abort_msg(const char*msg){
     std::puts(msg);
     std::abort();
+}
+
+uint64_t next_aligned_value(uint64_t val, uint64_t align){
+    return val%align==0 ?
+        val :
+        val + align - val % align;
 }
 
 namespace vkinit{
@@ -165,14 +173,95 @@ namespace vkutils{
     }; 
 
     struct BoundBuffer{
-        VkImage img;
+        VkBuffer buffer;
         VkDeviceSize size,offset;
+
+        void destroy(VkDevice dev){
+            vkDestroyBuffer(dev, this->buffer, nullptr);
+        }
     }; 
 
     struct BufferBAlloc{
         VkDeviceMemory dev_mem;
         VkDeviceSize cap, len;
         VkMemoryPropertyFlags properties;
+
+
+        static BufferBAlloc make(VkDevice dev, DeviceMemory &mem, MemoryTypes type, VkDeviceSize size, bool addressable=false){
+            VkMemoryAllocateFlagsInfoKHR flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO_KHR};
+            flags_info.flags             = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT_KHR;
+
+            VkMemoryAllocateInfo info = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .pNext = addressable? &flags_info : nullptr,
+                .allocationSize = size,
+                .memoryTypeIndex = (uint32_t)mem.types[(uint8_t)type]
+            };
+            VkDeviceMemory dev_mem;
+            VkResult res = vkAllocateMemory(dev, &info, NULL, &dev_mem);// TODO
+            if(res!=VK_SUCCESS) abort_msg("failed to alloc");
+
+            BufferBAlloc b{
+                .dev_mem = dev_mem,
+                .cap = size,
+                .len = 0,
+                .properties = mem.properties.memoryTypes->propertyFlags,
+            };
+
+            return b;
+        }
+        bool can_allocate(VkMemoryRequirements req){
+            if(this->len>=this->cap) return false;
+
+            VkDeviceSize nlen = this->len%req.alignment==0 ?
+                this->len :
+                this->len + req.alignment - this->len % req.alignment;
+
+            if(nlen+req.size>=this->cap) return false;
+            return true;
+        }
+
+        VkResult map(VkDevice dev, VkDeviceSize offset, VkDeviceSize size, void **out){
+            return vkMapMemory(dev, this->dev_mem, offset, size, 0, out);
+        }
+
+        void unmap(VkDevice dev){
+            vkUnmapMemory(dev, this->dev_mem);
+        }
+       
+        BoundBuffer bind_buffer(VkDevice dev, VkBuffer buffer, VkMemoryRequirements mem_req){
+            if((mem_req.memoryTypeBits & this->properties)==0){
+                abort_msg("wrong memory"); // TODO
+            }
+
+            VkDeviceSize nlen = this->len%mem_req.alignment==0 ?
+                this->len :
+                this->len + mem_req.alignment - this->len % mem_req.alignment;
+
+            if(nlen + mem_req.size > this->cap){
+                abort_msg("not enough memory"); // TODO
+            }
+
+            vkBindBufferMemory(dev, buffer, this->dev_mem, nlen);
+
+            BoundBuffer bbuf = {
+                .buffer = buffer,
+                .size = mem_req.size,
+                .offset = nlen,
+            };
+
+            this->len = nlen + mem_req.size;
+
+            return bbuf;
+        }
+
+        void destroy(VkDevice dev){
+            vkFreeMemory(dev, this->dev_mem, nullptr);
+        }
+
+        void reset(){
+            this->len = 0;
+        }
     };
 
     // TODO: check if its fine to share buffer and images in the same memory
@@ -440,6 +529,215 @@ namespace vkutils{
         }
         return shaderModule;
     }
+
+    struct AABB{
+        HMM_Vec3 min={FLT_MAX,FLT_MAX,FLT_MAX},max={FLT_MIN,FLT_MIN,FLT_MIN};
+
+        void update(HMM_Vec3 p){
+            if(p.X < this->min.X) this->min.X = p.X;
+            if(p.X > this->max.X) this->max.X = p.X;
+
+            if(p.Y < this->min.Y) this->min.Y = p.Y;
+            if(p.Y > this->max.Y) this->max.Y = p.Y;
+
+            if(p.Z < this->min.Z) this->min.Z = p.Z;
+            if(p.Z > this->max.Z) this->max.Z = p.Z;
+        }
+    };
+
+    struct MeshData{
+        AABB aabb;
+        uint32_t vert_start_ind, vert_len;
+    };
+
+    struct Scene{
+        BufferBAlloc allocator;
+        BoundBuffer vertex_buf, mesh_data_buf;
+
+        void destroy(VkDevice dev){
+            this->vertex_buf.destroy(dev);
+            this->mesh_data_buf.destroy(dev);
+            this->allocator.destroy(dev);
+        }
+    };
+
+    Scene read_gltf_meshes(VkDevice dev, DeviceMemory dev_mem, VkCommandBuffer cmd_buf, const char *path){
+        cgltf_options options = {};
+        cgltf_data *data;
+        cgltf_result res = cgltf_parse_file(&options, path, &data);
+        if(res != cgltf_result_success) abort_msg("gltf failed to parse file");
+
+        res = cgltf_validate(data);
+        if(res != cgltf_result_success) abort_msg("invalid gltf");
+
+        // get total size
+        uint32_t vertex_count=0;
+        uint32_t prim_count=0;
+        for(size_t mesh_i=0;mesh_i<data->meshes_count;++mesh_i){
+            cgltf_mesh *mesh = &data->meshes[mesh_i];
+            prim_count+=mesh->primitives_count;
+
+            for(size_t prim_i=0;prim_i<mesh->primitives_count;++prim_i){
+                cgltf_primitive *prim = &mesh->primitives[prim_i];
+
+                for(int32_t attr_i=0;attr_i<prim->attributes_count;++attr_i){
+                    cgltf_attribute *attr = &prim->attributes[attr_i];
+                    if(attr->type==cgltf_attribute_type_position){
+                        vertex_count += attr->data->count;
+                        break;
+                    }
+                }
+            }
+        }
+        uint64_t total_vertex_size_bytes = vertex_count * sizeof(HMM_Vec3);
+
+        VkBuffer vertex_buf, mesh_data_buf;
+        VkBufferCreateInfo vbuf_cinfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = total_vertex_size_bytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | 
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        };
+
+        VkBufferCreateInfo mbuf_cinfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = prim_count*sizeof(MeshData),
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        };
+
+        VkResult vkres = vkCreateBuffer(dev, &vbuf_cinfo, nullptr, &vertex_buf);
+        if(vkres != VK_SUCCESS) abort_msg("failed to create vertex buffer gltf");
+
+        vkres = vkCreateBuffer(dev, &mbuf_cinfo, nullptr, &mesh_data_buf);
+        if(vkres != VK_SUCCESS) abort_msg("failed to create mesh buffer gltf");
+
+        VkMemoryRequirements v_req, m_req;
+        vkGetBufferMemoryRequirements(dev, vertex_buf, &v_req);
+        vkGetBufferMemoryRequirements(dev, mesh_data_buf, &m_req);
+
+        VkDeviceSize req_mem_size = next_aligned_value(v_req.size, m_req.alignment) + m_req.size;
+
+        VkBuffer staging_buf;
+        VkBufferCreateInfo staging_cinfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = req_mem_size, // TODO better size
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        };
+
+        vkres = vkCreateBuffer(dev, &staging_cinfo, nullptr, &staging_buf);
+        if(vkres != VK_SUCCESS) abort_msg("failed to create staging buffer gltf");
+
+        VkMemoryRequirements s_req;
+        vkGetBufferMemoryRequirements(dev, staging_buf, &s_req);
+
+        auto staging_allocator = BufferBAlloc::make(dev, dev_mem, MemoryTypes::HOST_COHERENT, req_mem_size);
+        BoundBuffer staging_bb = staging_allocator.bind_buffer(dev, staging_buf, s_req);
+
+        auto gpu_allocator = BufferBAlloc::make(dev, dev_mem, MemoryTypes::DEVICE_LOCAL, req_mem_size, true);
+        BoundBuffer v_bb = gpu_allocator.bind_buffer(dev, vertex_buf, v_req);
+        BoundBuffer m_bb = gpu_allocator.bind_buffer(dev, mesh_data_buf, m_req);
+        
+        void *staging_p;
+        vkres = staging_allocator.map(dev, 0, req_mem_size, &staging_p);
+        if(vkres != VK_SUCCESS) abort_msg("failed to map gltf staging");
+
+        res = cgltf_load_buffers(&options, data, path);
+        if(res != cgltf_result_success) abort_msg("gltf failed to load buffers");
+
+        std::vector<MeshData> mesh_data{};
+        mesh_data.reserve(prim_count);
+
+        // copy vertex data to staging and build mesh data
+
+        std::memcpy(staging_p, &vertex_count, sizeof(vertex_count));
+        HMM_Vec3 *staging_vp = (HMM_Vec3*)((char*)staging_p+sizeof(vertex_count));
+        uint64_t staging_vp_ind = 0;
+        for(size_t mesh_i=0;mesh_i<data->meshes_count;++mesh_i){
+            cgltf_mesh *mesh = &data->meshes[mesh_i];
+
+            for(size_t prim_i=0;prim_i<mesh->primitives_count;++prim_i){
+                cgltf_primitive *prim = &mesh->primitives[prim_i];
+
+                MeshData prim_data{};
+
+                for(int32_t attr_i=0;attr_i<prim->attributes_count;++attr_i){
+                    cgltf_attribute *attr = &prim->attributes[attr_i];
+
+                    switch (attr->type) {
+                        case cgltf_attribute_type_position:{
+                            cgltf_accessor *acc = attr->data;
+                            if(acc->type!=cgltf_type_vec3) 
+                                abort_msg("gltf:unknown pos format");
+                            cgltf_size offset = acc->offset + acc->buffer_view->offset;
+                            cgltf_size pos_count = acc->count;
+                            cgltf_size stride = acc->stride;
+                            cgltf_size len = acc->buffer_view->size;
+                            char *data = static_cast<char*>(acc->buffer_view->buffer->data);
+
+                            prim_data.vert_start_ind = staging_vp_ind;
+                            prim_data.vert_len = len;
+                            for(cgltf_size data_i=offset;data_i<len;data_i+=stride){
+                                float *f_data = (float*)(data+data_i);
+                                HMM_Vec3 p = {f_data[0],f_data[1],f_data[2]};
+                                std::memcpy(staging_vp+staging_vp_ind, &p, sizeof(HMM_Vec3));
+                                staging_vp_ind++;
+
+                                prim_data.aabb.update(p);
+                            }
+                            break;
+                        } case cgltf_attribute_type_normal: {
+                            break;
+                        } default: break;
+                    }
+                }
+                mesh_data.push_back(prim_data);
+            }
+        }
+
+        // copy current staging data to gpu
+        VkBufferCopy vbuf_cpy = {
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = total_vertex_size_bytes,
+        };
+        vkCmdCopyBuffer(
+                cmd_buf, 
+                staging_buf, 
+                vertex_buf, 
+                1, 
+                &vbuf_cpy);
+
+        // copy mesh data to staging then to gpu
+        std::memcpy(staging_p, &prim_count, sizeof(prim_count));
+        MeshData *staging_mdata = (MeshData*)((char*)staging_p+sizeof(prim_count));
+        std::memcpy(staging_mdata, mesh_data.data(), sizeof(MeshData)*mesh_data.size());
+
+        VkBufferCopy mbuf_cpy = {
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = sizeof(MeshData)*mesh_data.size(),
+        };
+
+        vkCmdCopyBuffer(
+                cmd_buf, 
+                staging_buf, 
+                mesh_data_buf, 
+                1, 
+                &mbuf_cpy);
+
+        staging_bb.destroy(dev);
+        staging_allocator.unmap(dev);
+        staging_allocator.destroy(dev);
+        cgltf_free(data);
+
+        return Scene{
+            .allocator = gpu_allocator,
+            .vertex_buf = v_bb,
+            .mesh_data_buf = m_bb
+        };
+    }
+
 }
 
 struct RenderContext{
@@ -451,6 +749,14 @@ struct RenderContext{
         VkSemaphore swp_semaphore, render_semaphore;
         VkFence render_fence;
     };
+
+    struct PushConstantData{
+        HMM_Mat4 cam;
+        VkDeviceAddress v_addr;
+        VkDeviceAddress m_addr;
+        float fov_tan;
+    };
+    static_assert(sizeof(PushConstantData)<=128, "required");
 
     VkInstance instance;
     VkDebugUtilsMessengerEXT debug_messenger;
@@ -470,6 +776,8 @@ struct RenderContext{
     bool resize_requested=false;
 
     vkutils::DeviceMemory dev_mem;
+
+    vkutils::Scene scene;
 
     vkutils::ImageBAlloc img_allocator;
     vkutils::BoundImage bound_draw_img;
@@ -574,7 +882,7 @@ struct RenderContext{
         VkSurfaceKHR surface;
         VkResult err = windowhandles_create_surface(vkb_instance.instance,&wh,&surface);
         if(err!=VK_SUCCESS){
-            throw std::runtime_error("failed to create surface");
+            abort_msg("failed to create surface");
         }
 
         //vulkan 1.3 features
@@ -704,8 +1012,40 @@ struct RenderContext{
 
             res = vkCreateSemaphore(vkb_device.device, &sem_info, nullptr, &frames[i].render_semaphore);
             if(res!=VK_SUCCESS) abort_msg("failed to create frame sem");
-
         }
+
+        VkCommandBufferAllocateInfo init_cmd_buf_info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .commandPool = frames[0].cmd_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBuffer init_cmd_buf;
+        err = vkAllocateCommandBuffers(vkb_device, &init_cmd_buf_info, &init_cmd_buf);
+        if(err!=VK_SUCCESS)abort_msg("failed to alloc init cmd buf");
+
+        VkCommandBufferBeginInfo cmd_binfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        err = vkBeginCommandBuffer(init_cmd_buf, &cmd_binfo);
+        if(err!=VK_SUCCESS)abort_msg("failed to begin init cmd buf");
+
+        vkutils::Scene scene = vkutils::read_gltf_meshes(vkb_device, dev_mem, init_cmd_buf, "models/test.glb");
+        
+        vkEndCommandBuffer(init_cmd_buf);
+
+        VkCommandBufferSubmitInfo cmd_sub_info = vkutils::command_buffer_submit_info(init_cmd_buf);
+        VkSubmitInfo2 submit_info = vkutils::submit_info(&cmd_sub_info, nullptr, nullptr);
+        err = vkQueueSubmit2(g_queue, 1, &submit_info, VK_NULL_HANDLE);
+        if(err!=VK_SUCCESS)abort_msg("failed to submit init cmd buf");
+
+        err = vkQueueWaitIdle(g_queue); // TODO maybe use other sync
+        if(err!=VK_SUCCESS)abort_msg("failed to wait init cmds");
+
+        vkResetCommandPool(vkb_device, frames[0].cmd_pool, 0);
 
         // descriptors
 
@@ -770,17 +1110,24 @@ struct RenderContext{
         vkUpdateDescriptorSets(vkb_device, 1, &drawImageWrite, 0, nullptr);
 
         // create pipeline
+        VkPushConstantRange push_range = {
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = sizeof(PushConstantData),
+        };
         VkPipelineLayoutCreateInfo compute_layout{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .setLayoutCount = 1,
             .pSetLayouts = &desc_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
         };
         VkPipelineLayout pipeline_layout;
         err = vkCreatePipelineLayout(vkb_device, &compute_layout, nullptr, &pipeline_layout);
         if(err!=VK_SUCCESS) abort_msg("failed create pipeline layout");
 
-        auto shader_opt = vkutils::load_shader_module("./shaders/gradient.comp.spv", vkb_device);
+        auto shader_opt = vkutils::load_shader_module("./shaders/ray-tracer.comp.spv", vkb_device);
         if(!shader_opt) abort_msg("failed to read compute shader");
 
         VkShaderModule shader = shader_opt.value();
@@ -909,6 +1256,8 @@ struct RenderContext{
 
         ctx.dev_mem = dev_mem;
 
+        ctx.scene = scene;
+
         ctx.img_allocator = img_alloc;
         ctx.bound_draw_img = bound_img;
         ctx.draw_img_extent = VkExtent2D{.width=width,.height=height};
@@ -942,6 +1291,8 @@ struct RenderContext{
         vkDestroyImageView(this->dev, this->draw_img_view, nullptr);
         this->bound_draw_img.destroy(this->dev);
         this->img_allocator.destroy(this->dev);
+
+        this->scene.destroy(this->dev);
 
         vkDestroyPipeline(this->dev, this->gradient_pipeline, nullptr);
         vkDestroyPipelineLayout(this->dev, this->gradient_pipeline_layout, nullptr);
@@ -1038,6 +1389,23 @@ struct RenderContext{
 
         this->draw_img_extent = {draw_img_extent.width, draw_img_extent.height};
 
+        // update descriptor with new image view
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        imgInfo.imageView = this->draw_img_view;
+        
+        VkWriteDescriptorSet drawImageWrite = {};
+        drawImageWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        drawImageWrite.pNext = nullptr;
+        
+        drawImageWrite.dstBinding = 0;
+        drawImageWrite.dstSet = this->desc_set;
+        drawImageWrite.descriptorCount = 1;
+        drawImageWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        drawImageWrite.pImageInfo = &imgInfo;
+
+        vkUpdateDescriptorSets(this->dev, 1, &drawImageWrite, 0, nullptr);
+
         this->resize_requested = false;
     }
 
@@ -1124,76 +1492,106 @@ struct RenderContext{
 
         // graphics
         
-        vkutils::transition_image(
-                cmd_buffer,
-                this->bound_draw_img.img,
-                VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                //VK_IMAGE_LAYOUT_GENERAL);
+        //vkutils::transition_image(
+        //        cmd_buffer,
+        //        this->bound_draw_img.img,
+        //        VK_IMAGE_LAYOUT_UNDEFINED,
+        //        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        //        //VK_IMAGE_LAYOUT_GENERAL);
 
-        VkRenderingAttachmentInfo color_att_info = {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = this->draw_img_view,
-            .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-            .storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE,
-        };
-        VkRenderingInfo render_info = {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = VkRect2D{
-                .offset=VkOffset2D{0,0},
-                .extent=this->draw_img_extent,
-            },
-            .layerCount = 1,
-            .colorAttachmentCount = 1,
-            .pColorAttachments = &color_att_info
-        };
+        //VkRenderingAttachmentInfo color_att_info = {
+        //    .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        //    .imageView = this->draw_img_view,
+        //    .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        //    .loadOp = VkAttachmentLoadOp::VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        //    .storeOp = VkAttachmentStoreOp::VK_ATTACHMENT_STORE_OP_STORE,
+        //};
+        //VkRenderingInfo render_info = {
+        //    .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        //    .renderArea = VkRect2D{
+        //        .offset=VkOffset2D{0,0},
+        //        .extent=this->draw_img_extent,
+        //    },
+        //    .layerCount = 1,
+        //    .colorAttachmentCount = 1,
+        //    .pColorAttachments = &color_att_info
+        //};
 
-        vkCmdBeginRendering(cmd_buffer, &render_info);
+        //vkCmdBeginRendering(cmd_buffer, &render_info);
         
-        vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, this->g_pipeline);
-        VkViewport viewport = {
-            .x = 0,
-            .y = 0,
-            .width = (float)this->draw_img_extent.width,
-            .height = (float)this->draw_img_extent.height,
-            .minDepth = 0.f,
-            .maxDepth = 1.f,
-        };
+        //vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, this->g_pipeline);
+        //VkViewport viewport = {
+        //    .x = 0,
+        //    .y = 0,
+        //    .width = (float)this->draw_img_extent.width,
+        //    .height = (float)this->draw_img_extent.height,
+        //    .minDepth = 0.f,
+        //    .maxDepth = 1.f,
+        //};
 
-        vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
+        //vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
 
-        VkRect2D scissor = {};
-        scissor.offset.x = 0;
-        scissor.offset.y = 0;
-        scissor.extent.width = this->draw_img_extent.width;
-        scissor.extent.height = this->draw_img_extent.height;
+        //VkRect2D scissor = {};
+        //scissor.offset.x = 0;
+        //scissor.offset.y = 0;
+        //scissor.extent.width = this->draw_img_extent.width;
+        //scissor.extent.height = this->draw_img_extent.height;
 
-        vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
+        //vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
 
-        //launch a draw command to draw 3 vertices
-        vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
+        ////launch a draw command to draw 3 vertices
+        //vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
 
-        vkCmdEndRendering(cmd_buffer);
+        //vkCmdEndRendering(cmd_buffer);
 
         // compute
-        //vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->gradient_pipeline);
-        //vkCmdBindDescriptorSets(
-        //    cmd_buffer,
-        //    VK_PIPELINE_BIND_POINT_COMPUTE,
-        //    this->gradient_pipeline_layout,
-        //    0,1,
-        //    &this->desc_set,
-        //    0, nullptr);
+        vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, this->gradient_pipeline);
+        vkCmdBindDescriptorSets(
+            cmd_buffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            this->gradient_pipeline_layout,
+            0,1,
+            &this->desc_set,
+            0, nullptr);
 
-        //vkCmdDispatch(
-        //    cmd_buffer, 
-        //    std::ceil(this->draw_img_extent.width / 16.0), 
-        //    std::ceil(this->draw_img_extent.height / 16.0),
-        //    1);
+        VkBufferDeviceAddressInfo v_addr_info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = this->scene.vertex_buf.buffer
+        };
+        VkDeviceAddress v_addr = vkGetBufferDeviceAddress(this->dev, &v_addr_info);
+
+        VkBufferDeviceAddressInfo m_addr_info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = this->scene.mesh_data_buf.buffer
+        };
+        VkDeviceAddress m_addr = vkGetBufferDeviceAddress(this->dev, &m_addr_info);
+
+        HMM_Mat4 cam = HMM_LookAt_RH(HMM_Vec3{5.0,5.0,0.0}, HMM_Vec3{0.0,0.0,0.0}, HMM_Vec3{0.0,1.0,0.0});
+        cam = HMM_InvGeneralM4(cam);
+
+        PushConstantData pc_data = {
+            .cam = cam,
+            .v_addr = v_addr,
+            .m_addr = m_addr,
+            .fov_tan = static_cast<float>(std::tan(60.0 * std::numbers::pi / 180.0 / 2.0)),
+        };
+
+        vkCmdPushConstants(
+                cmd_buffer, 
+                this->gradient_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0, 
+                sizeof(PushConstantData),
+                &pc_data);
+
+        vkCmdDispatch(
+            cmd_buffer, 
+            std::ceil(this->draw_img_extent.width / 16.0), 
+            std::ceil(this->draw_img_extent.height / 16.0),
+            1);
 
         // write to swapchain image
-        vkutils::transition_image(cmd_buffer, this->bound_draw_img.img,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkutils::transition_image(cmd_buffer, this->bound_draw_img.img,VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         vkutils::transition_image(cmd_buffer, this->swp_images[swp_img_ind],VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
         // TODO: decouple draw img and swapchain extents
