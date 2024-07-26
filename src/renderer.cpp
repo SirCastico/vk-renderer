@@ -1427,10 +1427,12 @@ struct RenderContext{
                 frame.swp_semaphore,
                 nullptr,
                 &swp_img_ind);
-        if(res==VK_ERROR_OUT_OF_DATE_KHR || res==VK_SUBOPTIMAL_KHR){
+        if(res==VK_ERROR_OUT_OF_DATE_KHR){
             puts("acquire img request resize");
             this->resize_requested = true;
             return;
+        } else if(res==VK_SUBOPTIMAL_KHR){
+            puts("suboptimal swapchain");
         } else if(res==VK_TIMEOUT){
             abort_msg("img acquire timedout");
         } else if(res==VK_NOT_READY){
@@ -1586,8 +1588,8 @@ struct RenderContext{
 
         vkCmdDispatch(
             cmd_buffer, 
-            std::ceil(this->draw_img_extent.width / 16.0), 
-            std::ceil(this->draw_img_extent.height / 16.0),
+            std::ceil(this->draw_img_extent.width / 32.0), 
+            std::ceil(this->draw_img_extent.height / 32.0),
             1);
 
         // write to swapchain image
