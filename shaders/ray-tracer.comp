@@ -3,7 +3,7 @@
 #extension GL_EXT_buffer_reference : require
 
 //size of a workgroup for compute, specialization constants can be used
-layout (local_size_x = 32) in;
+layout (local_size_x = 8, local_size_y = 8) in;
 
 //descriptor bindings for the pipeline
 layout(rgba16f,set = 0, binding = 0) uniform image2D image;

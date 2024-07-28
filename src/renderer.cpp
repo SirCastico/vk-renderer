@@ -1470,12 +1470,6 @@ struct RenderContext{
         res = vkBeginCommandBuffer(cmd_buffer, &cmd_info);
         if(res!=VK_SUCCESS) abort_msg("failed to begin command buffer");
 
-        vkutils::transition_image(
-                cmd_buffer,
-                this->bound_draw_img.img,
-                VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_GENERAL);
-
         //make a clear-color from frame number. This will flash with a 120 frame period.
         VkClearColorValue clearValue;
         float flash = std::abs(std::sin(this->frame_count / 120.f));
@@ -1491,6 +1485,12 @@ struct RenderContext{
 
         //clear image
         vkCmdClearColorImage(cmd_buffer, this->bound_draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
+
+        vkutils::transition_image( // TODO barrier needed here
+                cmd_buffer,
+                this->bound_draw_img.img,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_GENERAL);
 
         // graphics
         
@@ -1588,8 +1588,8 @@ struct RenderContext{
 
         vkCmdDispatch(
             cmd_buffer, 
-            std::ceil(this->draw_img_extent.width / 32.0), 
-            std::ceil(this->draw_img_extent.height / 32.0),
+            std::ceil(this->draw_img_extent.width/8.0), 
+            std::ceil(this->draw_img_extent.height/8.0),
             1);
 
         // write to swapchain image
