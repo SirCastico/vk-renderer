@@ -80,11 +80,11 @@ void main() {
     float px = (2.0*((texel_coord.x+0.5)/image_size.x)-1.0) * data.fov_tan * aspect_ratio;
     float py = (1.0-2.0*((texel_coord.y+0.5)/image_size.y)) * data.fov_tan;
 
-    //vec4 ray_origin = vec4(0.0,0.0,0.0,1.0) * data.cam;
-    //vec4 ray_dir = normalize(vec4(px,py,-1.0,0.0)) * data.cam;
-    //ray_dir = normalize(ray_dir);
-    //
-    //vec4 color = render(ray_origin,ray_dir);
+    vec4 ray_origin = vec4(0.0,0.0,0.0,1.0) * data.cam;
+    vec4 ray_dir = normalize(vec4(px,py,-1.0,0.0)) * data.cam;
+    ray_dir = normalize(ray_dir);
+    
+    vec4 color = render(ray_origin,ray_dir);
 
-    imageStore(image, ivec2(gl_GlobalInvocationID.xy), vec4(1.0,0.0,0.0,1.0));
+    imageStore(image, ivec2(gl_GlobalInvocationID.xy), color);
 }

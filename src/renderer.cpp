@@ -552,7 +552,7 @@ namespace vkutils{
 
     struct Scene{
         BufferBAlloc allocator;
-        BoundBuffer vertex_buf, mesh_data_buf;
+        BoundBuffer vertex_buf, mesh_data_buf, staging_bb; // TODO temp
 
         void destroy(VkDevice dev){
             this->vertex_buf.destroy(dev);
@@ -561,7 +561,7 @@ namespace vkutils{
         }
     };
 
-    Scene read_gltf_meshes(VkDevice dev, DeviceMemory dev_mem, VkCommandBuffer cmd_buf, const char *path){
+    Scene read_gltf_meshes(VkDevice dev, DeviceMemory dev_mem, VkCommandBuffer cmd_buf, BufferBAlloc &staging_allocator, const char *path){
         cgltf_options options = {};
         cgltf_data *data;
         cgltf_result res = cgltf_parse_file(&options, path, &data);
@@ -594,14 +594,14 @@ namespace vkutils{
         VkBuffer vertex_buf, mesh_data_buf;
         VkBufferCreateInfo vbuf_cinfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = total_vertex_size_bytes,
+            .size = total_vertex_size_bytes + sizeof(uint32_t),
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | 
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         };
 
         VkBufferCreateInfo mbuf_cinfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = prim_count*sizeof(MeshData),
+            .size = prim_count*sizeof(MeshData) + sizeof(uint32_t),
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         };
@@ -616,12 +616,13 @@ namespace vkutils{
         vkGetBufferMemoryRequirements(dev, vertex_buf, &v_req);
         vkGetBufferMemoryRequirements(dev, mesh_data_buf, &m_req);
 
-        VkDeviceSize req_mem_size = next_aligned_value(v_req.size, m_req.alignment) + m_req.size;
+        VkDeviceSize mesh_data_offset_size = next_aligned_value(v_req.size, m_req.alignment);
+        VkDeviceSize req_mem_size =  mesh_data_offset_size + m_req.size;
 
         VkBuffer staging_buf;
         VkBufferCreateInfo staging_cinfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = req_mem_size, // TODO better size
+            .size = req_mem_size,
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         };
 
@@ -631,7 +632,10 @@ namespace vkutils{
         VkMemoryRequirements s_req;
         vkGetBufferMemoryRequirements(dev, staging_buf, &s_req);
 
-        auto staging_allocator = BufferBAlloc::make(dev, dev_mem, MemoryTypes::HOST_COHERENT, req_mem_size);
+        if(!staging_allocator.can_allocate(s_req)){
+            staging_allocator.destroy(dev);
+            staging_allocator = BufferBAlloc::make(dev, dev_mem, MemoryTypes::HOST_COHERENT, s_req.size);
+        }
         BoundBuffer staging_bb = staging_allocator.bind_buffer(dev, staging_buf, s_req);
 
         auto gpu_allocator = BufferBAlloc::make(dev, dev_mem, MemoryTypes::DEVICE_LOCAL, req_mem_size, true);
@@ -699,7 +703,7 @@ namespace vkutils{
         VkBufferCopy vbuf_cpy = {
             .srcOffset = 0,
             .dstOffset = 0,
-            .size = total_vertex_size_bytes,
+            .size = total_vertex_size_bytes + sizeof(uint32_t),
         };
         vkCmdCopyBuffer(
                 cmd_buf, 
@@ -709,12 +713,13 @@ namespace vkutils{
                 &vbuf_cpy);
 
         // copy mesh data to staging then to gpu
-        std::memcpy(staging_p, &prim_count, sizeof(prim_count));
-        MeshData *staging_mdata = (MeshData*)((char*)staging_p+sizeof(prim_count));
+        char *staging_mp = (char*)staging_p+mesh_data_offset_size;
+        std::memcpy(staging_mp, &prim_count, sizeof(prim_count));
+        MeshData *staging_mdata = (MeshData*)(staging_mp+sizeof(prim_count));
         std::memcpy(staging_mdata, mesh_data.data(), sizeof(MeshData)*mesh_data.size());
 
         VkBufferCopy mbuf_cpy = {
-            .srcOffset = 0,
+            .srcOffset = mesh_data_offset_size,
             .dstOffset = 0,
             .size = sizeof(MeshData)*mesh_data.size(),
         };
@@ -726,15 +731,16 @@ namespace vkutils{
                 1, 
                 &mbuf_cpy);
 
-        staging_bb.destroy(dev);
+        // TODO staging buffer needs to live until copies are done
+
         staging_allocator.unmap(dev);
-        staging_allocator.destroy(dev);
         cgltf_free(data);
 
         return Scene{
             .allocator = gpu_allocator,
             .vertex_buf = v_bb,
-            .mesh_data_buf = m_bb
+            .mesh_data_buf = m_bb,
+            .staging_bb = staging_bb,
         };
     }
 
@@ -752,8 +758,8 @@ struct RenderContext{
 
     struct PushConstantData{
         HMM_Mat4 cam;
-        VkDeviceAddress v_addr;
         VkDeviceAddress m_addr;
+        VkDeviceAddress v_addr;
         float fov_tan;
     };
     static_assert(sizeof(PushConstantData)<=128, "required");
@@ -1033,7 +1039,8 @@ struct RenderContext{
         err = vkBeginCommandBuffer(init_cmd_buf, &cmd_binfo);
         if(err!=VK_SUCCESS)abort_msg("failed to begin init cmd buf");
 
-        vkutils::Scene scene = vkutils::read_gltf_meshes(vkb_device, dev_mem, init_cmd_buf, "models/test.glb");
+        vkutils::BufferBAlloc staging_allocator{};
+        vkutils::Scene scene = vkutils::read_gltf_meshes(vkb_device, dev_mem, init_cmd_buf, staging_allocator, "models/test.glb");
         
         vkEndCommandBuffer(init_cmd_buf);
 
@@ -1044,6 +1051,9 @@ struct RenderContext{
 
         err = vkQueueWaitIdle(g_queue); // TODO maybe use other sync
         if(err!=VK_SUCCESS)abort_msg("failed to wait init cmds");
+
+        scene.staging_bb.destroy(vkb_device);
+        staging_allocator.destroy(vkb_device);
 
         vkResetCommandPool(vkb_device, frames[0].cmd_pool, 0);
 
@@ -1573,8 +1583,8 @@ struct RenderContext{
 
         PushConstantData pc_data = {
             .cam = cam,
-            .v_addr = v_addr,
             .m_addr = m_addr,
+            .v_addr = v_addr,
             .fov_tan = static_cast<float>(std::tan(60.0 * std::numbers::pi / 180.0 / 2.0)),
         };
 
