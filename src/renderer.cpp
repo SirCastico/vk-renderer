@@ -1,12 +1,14 @@
 #include "renderer.h"
 
 #include <array>
+#include <cassert>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <numbers>
 #include <optional>
 #include <vector>
@@ -531,7 +533,15 @@ namespace vkutils{
     }
 
     struct AABB{
-        HMM_Vec3 min={FLT_MAX,FLT_MAX,FLT_MAX},max={FLT_MIN,FLT_MIN,FLT_MIN};
+        HMM_Vec3 min={
+            std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::max()
+        }, max={
+            std::numeric_limits<float>::lowest(),
+            std::numeric_limits<float>::lowest(),
+            std::numeric_limits<float>::lowest()
+         };
 
         void update(HMM_Vec3 p){
             if(p.X < this->min.X) this->min.X = p.X;
@@ -547,15 +557,16 @@ namespace vkutils{
 
     struct MeshData{
         AABB aabb;
-        uint32_t vert_start_ind, vert_len;
+        uint32_t ind_start_ind, ind_len;
     };
 
     struct Scene{
         BufferBAlloc allocator;
-        BoundBuffer vertex_buf, mesh_data_buf, staging_bb; // TODO temp
+        BoundBuffer vertex_buf, mesh_metadata_buf, mesh_data_buf, staging_bb; // TODO temp
 
         void destroy(VkDevice dev){
             this->vertex_buf.destroy(dev);
+            this->mesh_metadata_buf.destroy(dev);
             this->mesh_data_buf.destroy(dev);
             this->allocator.destroy(dev);
         }
@@ -571,14 +582,14 @@ namespace vkutils{
         if(res != cgltf_result_success) abort_msg("invalid gltf");
 
         // get total size
-        uint32_t vertex_count=0;
-        uint32_t prim_count=0;
+        uint32_t vertex_count=0, prim_count=0, ind_count=0;
         for(size_t mesh_i=0;mesh_i<data->meshes_count;++mesh_i){
             cgltf_mesh *mesh = &data->meshes[mesh_i];
             prim_count+=mesh->primitives_count;
 
             for(size_t prim_i=0;prim_i<mesh->primitives_count;++prim_i){
                 cgltf_primitive *prim = &mesh->primitives[prim_i];
+                ind_count += prim->indices->count;
 
                 for(int32_t attr_i=0;attr_i<prim->attributes_count;++attr_i){
                     cgltf_attribute *attr = &prim->attributes[attr_i];
@@ -591,17 +602,24 @@ namespace vkutils{
         }
         uint64_t total_vertex_size_bytes = vertex_count * sizeof(HMM_Vec3);
 
-        VkBuffer vertex_buf, mesh_data_buf;
+        VkBuffer mesh_data_buf, vertex_buf, mesh_metadata_buf;
         VkBufferCreateInfo vbuf_cinfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = total_vertex_size_bytes + sizeof(uint32_t),
+            .size = total_vertex_size_bytes,
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | 
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         };
 
-        VkBufferCreateInfo mbuf_cinfo = {
+        VkBufferCreateInfo meta_buf_cinfo = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = prim_count*sizeof(MeshData) + sizeof(uint32_t),
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        };
+
+        VkBufferCreateInfo mesh_data_buf_cinfo = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = sizeof(uint32_t) + sizeof(VkDeviceAddress) + ind_count * sizeof(uint32_t),
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         };
@@ -609,15 +627,21 @@ namespace vkutils{
         VkResult vkres = vkCreateBuffer(dev, &vbuf_cinfo, nullptr, &vertex_buf);
         if(vkres != VK_SUCCESS) abort_msg("failed to create vertex buffer gltf");
 
-        vkres = vkCreateBuffer(dev, &mbuf_cinfo, nullptr, &mesh_data_buf);
-        if(vkres != VK_SUCCESS) abort_msg("failed to create mesh buffer gltf");
+        vkres = vkCreateBuffer(dev, &meta_buf_cinfo, nullptr, &mesh_metadata_buf);
+        if(vkres != VK_SUCCESS) abort_msg("failed to create mesh metadata buffer gltf");
 
-        VkMemoryRequirements v_req, m_req;
+        vkres = vkCreateBuffer(dev, &mesh_data_buf_cinfo, nullptr, &mesh_data_buf);
+        if(vkres != VK_SUCCESS) abort_msg("failed to create mesh data buffer gltf");
+
+        VkMemoryRequirements v_req, meta_req, mesh_data_req;
         vkGetBufferMemoryRequirements(dev, vertex_buf, &v_req);
-        vkGetBufferMemoryRequirements(dev, mesh_data_buf, &m_req);
+        vkGetBufferMemoryRequirements(dev, mesh_metadata_buf, &meta_req);
+        vkGetBufferMemoryRequirements(dev, mesh_data_buf, &mesh_data_req);
 
-        VkDeviceSize mesh_data_offset_size = next_aligned_value(v_req.size, m_req.alignment);
-        VkDeviceSize req_mem_size =  mesh_data_offset_size + m_req.size;
+        VkDeviceSize mesh_data_offset = 0;
+        VkDeviceSize vertex_data_offset = next_aligned_value(mesh_data_req.size, v_req.alignment);
+        VkDeviceSize mesh_metadata_offset_size = next_aligned_value(vertex_data_offset+v_req.size, meta_req.alignment);
+        VkDeviceSize req_mem_size =  mesh_metadata_offset_size + meta_req.size;
 
         VkBuffer staging_buf;
         VkBufferCreateInfo staging_cinfo = {
@@ -639,8 +663,9 @@ namespace vkutils{
         BoundBuffer staging_bb = staging_allocator.bind_buffer(dev, staging_buf, s_req);
 
         auto gpu_allocator = BufferBAlloc::make(dev, dev_mem, MemoryTypes::DEVICE_LOCAL, req_mem_size, true);
+        BoundBuffer mesh_data_bb = gpu_allocator.bind_buffer(dev, mesh_data_buf, mesh_data_req);
         BoundBuffer v_bb = gpu_allocator.bind_buffer(dev, vertex_buf, v_req);
-        BoundBuffer m_bb = gpu_allocator.bind_buffer(dev, mesh_data_buf, m_req);
+        BoundBuffer meta_bb = gpu_allocator.bind_buffer(dev, mesh_metadata_buf, meta_req);
         
         void *staging_p;
         vkres = staging_allocator.map(dev, 0, req_mem_size, &staging_p);
@@ -652,19 +677,52 @@ namespace vkutils{
         std::vector<MeshData> mesh_data{};
         mesh_data.reserve(prim_count);
 
-        // copy vertex data to staging and build mesh data
+        VkBufferDeviceAddressInfo v_addr_info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = v_bb.buffer
+        };
+        VkDeviceAddress m_addr = vkGetBufferDeviceAddress(dev, &v_addr_info);
 
-        std::memcpy(staging_p, &vertex_count, sizeof(vertex_count));
-        HMM_Vec3 *staging_vp = (HMM_Vec3*)((char*)staging_p+sizeof(vertex_count));
-        uint64_t staging_vp_ind = 0;
+        std::memcpy(staging_p, &m_addr, sizeof(m_addr));
+        std::memcpy((char*)staging_p+sizeof(m_addr), &ind_count, sizeof(ind_count));
+
+        uint32_t *staging_ip = (uint32_t*)((char*)staging_p+sizeof(vertex_count)+sizeof(m_addr));
+        uint64_t staging_ip_ind = 0;
         for(size_t mesh_i=0;mesh_i<data->meshes_count;++mesh_i){
             cgltf_mesh *mesh = &data->meshes[mesh_i];
 
             for(size_t prim_i=0;prim_i<mesh->primitives_count;++prim_i){
                 cgltf_primitive *prim = &mesh->primitives[prim_i];
 
-                MeshData prim_data{};
+                mesh_data.push_back(MeshData{
+                    .ind_start_ind = (uint32_t)staging_ip_ind,
+                    .ind_len = (uint32_t)prim->indices->count,
+                });
 
+                if(prim->indices->component_type!=cgltf_component_type_r_16u) abort_msg("unsupported ind type");
+
+                cgltf_size offset = prim->indices->offset + prim->indices->buffer_view->offset;
+                cgltf_size ind_count = prim->indices->count;
+                cgltf_size stride = prim->indices->stride;
+                cgltf_size len = prim->indices->buffer_view->size;
+                char *data = (char*)prim->indices->buffer_view->buffer->data;
+                for(cgltf_size data_i=offset;data_i<len+offset;data_i+=stride){
+                    staging_ip[staging_ip_ind] = (uint32_t)(*(uint16_t*)(data+data_i));
+                    staging_ip_ind++;
+                }
+            }
+        }
+
+
+        HMM_Vec3 *staging_vp = (HMM_Vec3*)((char*)staging_p+vertex_data_offset);
+        uint64_t staging_vp_ind = 0, mesh_data_ind=0;
+        for(size_t mesh_i=0;mesh_i<data->meshes_count;++mesh_i){
+            cgltf_mesh *mesh = &data->meshes[mesh_i];
+
+            for(size_t prim_i=0;prim_i<mesh->primitives_count;++prim_i){
+                cgltf_primitive *prim = &mesh->primitives[prim_i];
+
+                AABB aabb{};
                 for(int32_t attr_i=0;attr_i<prim->attributes_count;++attr_i){
                     cgltf_attribute *attr = &prim->attributes[attr_i];
 
@@ -679,15 +737,14 @@ namespace vkutils{
                             cgltf_size len = acc->buffer_view->size;
                             char *data = static_cast<char*>(acc->buffer_view->buffer->data);
 
-                            prim_data.vert_start_ind = staging_vp_ind;
-                            prim_data.vert_len = len;
-                            for(cgltf_size data_i=offset;data_i<len;data_i+=stride){
+
+                            for(cgltf_size data_i=offset;data_i<len+offset;data_i+=stride){
                                 float *f_data = (float*)(data+data_i);
                                 HMM_Vec3 p = {f_data[0],f_data[1],f_data[2]};
                                 std::memcpy(staging_vp+staging_vp_ind, &p, sizeof(HMM_Vec3));
                                 staging_vp_ind++;
 
-                                prim_data.aabb.update(p);
+                                aabb.update(p);
                             }
                             break;
                         } case cgltf_attribute_type_normal: {
@@ -695,15 +752,36 @@ namespace vkutils{
                         } default: break;
                     }
                 }
-                mesh_data.push_back(prim_data);
+                mesh_data[mesh_data_ind].aabb = aabb;
+                mesh_data_ind++;
             }
         }
 
-        // copy current staging data to gpu
-        VkBufferCopy vbuf_cpy = {
+        // copy mesh metadata to staging 
+        char *staging_mp = (char*)staging_p+mesh_metadata_offset_size;
+        std::memcpy(staging_mp, &prim_count, sizeof(prim_count));
+        MeshData *staging_mdata = (MeshData*)(staging_mp+sizeof(prim_count));
+        std::memcpy(staging_mdata, mesh_data.data(), sizeof(MeshData)*mesh_data.size());
+
+        // copy staging mesh data to gpu
+        VkBufferCopy mdata_buf_cpy = {
             .srcOffset = 0,
             .dstOffset = 0,
-            .size = total_vertex_size_bytes + sizeof(uint32_t),
+            .size = sizeof(uint32_t) + sizeof(VkDeviceAddress) + ind_count * sizeof(uint32_t),
+        };
+        vkCmdCopyBuffer(
+                cmd_buf, 
+                staging_buf, 
+                mesh_data_buf, 
+                1, 
+                &mdata_buf_cpy);
+
+
+        // copy staging vertex data to gpu
+        VkBufferCopy vbuf_cpy = {
+            .srcOffset = vertex_data_offset,
+            .dstOffset = 0,
+            .size = total_vertex_size_bytes,
         };
         vkCmdCopyBuffer(
                 cmd_buf, 
@@ -712,34 +790,28 @@ namespace vkutils{
                 1, 
                 &vbuf_cpy);
 
-        // copy mesh data to staging then to gpu
-        char *staging_mp = (char*)staging_p+mesh_data_offset_size;
-        std::memcpy(staging_mp, &prim_count, sizeof(prim_count));
-        MeshData *staging_mdata = (MeshData*)(staging_mp+sizeof(prim_count));
-        std::memcpy(staging_mdata, mesh_data.data(), sizeof(MeshData)*mesh_data.size());
-
+        // copy staging mesh metadata to gpu
         VkBufferCopy mbuf_cpy = {
-            .srcOffset = mesh_data_offset_size,
+            .srcOffset = mesh_metadata_offset_size,
             .dstOffset = 0,
-            .size = sizeof(MeshData)*mesh_data.size(),
+            .size = sizeof(MeshData)*mesh_data.size() + sizeof(uint32_t),
         };
 
         vkCmdCopyBuffer(
                 cmd_buf, 
                 staging_buf, 
-                mesh_data_buf, 
+                mesh_metadata_buf, 
                 1, 
                 &mbuf_cpy);
 
-        // TODO staging buffer needs to live until copies are done
 
-        staging_allocator.unmap(dev);
         cgltf_free(data);
 
         return Scene{
             .allocator = gpu_allocator,
             .vertex_buf = v_bb,
-            .mesh_data_buf = m_bb,
+            .mesh_metadata_buf = meta_bb,
+            .mesh_data_buf = mesh_data_bb,
             .staging_bb = staging_bb,
         };
     }
@@ -758,8 +830,8 @@ struct RenderContext{
 
     struct PushConstantData{
         HMM_Mat4 cam;
-        VkDeviceAddress m_addr;
-        VkDeviceAddress v_addr;
+        VkDeviceAddress mesh_meta_addr;
+        VkDeviceAddress mesh_data_addr;
         float fov_tan;
     };
     static_assert(sizeof(PushConstantData)<=128, "required");
@@ -1052,6 +1124,7 @@ struct RenderContext{
         err = vkQueueWaitIdle(g_queue); // TODO maybe use other sync
         if(err!=VK_SUCCESS)abort_msg("failed to wait init cmds");
 
+        staging_allocator.unmap(vkb_device);
         scene.staging_bb.destroy(vkb_device);
         staging_allocator.destroy(vkb_device);
 
@@ -1493,6 +1566,12 @@ struct RenderContext{
             .layerCount = VK_REMAINING_ARRAY_LAYERS,
         };
 
+        vkutils::transition_image( 
+                cmd_buffer,
+                this->bound_draw_img.img,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_GENERAL);
+
         //clear image
         vkCmdClearColorImage(cmd_buffer, this->bound_draw_img.img, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &clearRange);
 
@@ -1566,25 +1645,25 @@ struct RenderContext{
             &this->desc_set,
             0, nullptr);
 
-        VkBufferDeviceAddressInfo v_addr_info = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
-            .buffer = this->scene.vertex_buf.buffer
-        };
-        VkDeviceAddress v_addr = vkGetBufferDeviceAddress(this->dev, &v_addr_info);
-
-        VkBufferDeviceAddressInfo m_addr_info = {
+        VkBufferDeviceAddressInfo mdata_addr_info = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
             .buffer = this->scene.mesh_data_buf.buffer
         };
-        VkDeviceAddress m_addr = vkGetBufferDeviceAddress(this->dev, &m_addr_info);
+        VkDeviceAddress mdata_addr = vkGetBufferDeviceAddress(this->dev, &mdata_addr_info);
 
-        HMM_Mat4 cam = HMM_LookAt_RH(HMM_Vec3{5.0,5.0,0.0}, HMM_Vec3{0.0,0.0,0.0}, HMM_Vec3{0.0,1.0,0.0});
+        VkBufferDeviceAddressInfo m_addr_info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = this->scene.mesh_metadata_buf.buffer
+        };
+        VkDeviceAddress mmeta_addr = vkGetBufferDeviceAddress(this->dev, &m_addr_info);
+
+        HMM_Mat4 cam = HMM_LookAt_RH(HMM_Vec3{50.0,50.0,0.0}, HMM_Vec3{0.0,0.0,0.0}, HMM_Vec3{0.0,1.0,0.0});
         cam = HMM_InvGeneralM4(cam);
 
         PushConstantData pc_data = {
             .cam = cam,
-            .m_addr = m_addr,
-            .v_addr = v_addr,
+            .mesh_meta_addr = mmeta_addr,
+            .mesh_data_addr = mdata_addr,
             .fov_tan = static_cast<float>(std::tan(60.0 * std::numbers::pi / 180.0 / 2.0)),
         };
 

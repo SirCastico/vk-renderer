@@ -1,6 +1,7 @@
 //GLSL version to use
 #version 460
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
 
 //size of a workgroup for compute, specialization constants can be used
 layout (local_size_x = 8, local_size_y = 8) in;
@@ -14,27 +15,32 @@ struct AABB{
 
 struct MeshData{
     AABB aabb;
-    uint verts_start_i, len;
+    uint inds_start_i, len;
 };
 
 struct Vertex{
     vec3 pos;
 };
 
-layout(buffer_reference, std430, buffer_reference_align=8) readonly buffer MeshDataBuffer{
+layout(buffer_reference, scalar, buffer_reference_align=8) readonly buffer MeshMetaDataBuffer{
     uint size;
     MeshData meshes[];
 };
 
-layout(buffer_reference, std430, buffer_reference_align=8) readonly buffer MeshVertexBuffer{
-    uint size;
+layout(buffer_reference, scalar, buffer_reference_align=8) readonly buffer VertexBuffer{
     vec3 vertices[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align=8) readonly buffer MeshDataBuffer{
+    VertexBuffer vertices;
+    uint ind_count;
+    uint indices[];
 };
 
 layout(push_constant, std430) uniform Data{
     mat4 cam;
+    MeshMetaDataBuffer mesh_metadata_ref;
     MeshDataBuffer mesh_data_ref;
-    MeshVertexBuffer mesh_vertices_ref;
     float fov_tan;
 }data;
 
@@ -63,8 +69,8 @@ bool ray_aabb_collision(AABB aabb, vec4 origin, vec4 dir){
 
 vec4 render(vec4 origin, vec4 dir){
     vec4 color = vec4(0.0,0.0,1.0,1.0);
-    for(uint mesh_i=0;mesh_i<data.mesh_data_ref.size;++mesh_i){
-        if(ray_aabb_collision(data.mesh_data_ref.meshes[mesh_i].aabb, origin, dir)){
+    for(uint mesh_i=0;mesh_i<data.mesh_metadata_ref.size;++mesh_i){
+        if(ray_aabb_collision(data.mesh_metadata_ref.meshes[mesh_i].aabb, origin, dir)){
             color = vec4(1.0,0.0,0.0,1.0);
             break;
         }
