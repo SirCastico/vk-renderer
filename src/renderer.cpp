@@ -1657,7 +1657,7 @@ struct RenderContext{
         };
         VkDeviceAddress mmeta_addr = vkGetBufferDeviceAddress(this->dev, &m_addr_info);
 
-        HMM_Mat4 cam = HMM_LookAt_RH(HMM_Vec3{50.0,50.0,0.0}, HMM_Vec3{0.0,0.0,0.0}, HMM_Vec3{0.0,1.0,0.0});
+        HMM_Mat4 cam = HMM_LookAt_RH(HMM_Vec3{10.0,10.0,10.0}, HMM_Vec3{0.0,0.0,0.0}, HMM_Vec3{0.0,1.0,0.0});
         cam = HMM_InvGeneralM4(cam);
 
         PushConstantData pc_data = {

@@ -2,6 +2,7 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_debug_printf : enable
 
 //size of a workgroup for compute, specialization constants can be used
 layout (local_size_x = 8, local_size_y = 8) in;
@@ -80,16 +81,20 @@ vec4 render(vec4 origin, vec4 dir){
 
 void main() {
     ivec2 image_size = imageSize(image);
+    if(gl_GlobalInvocationID.x>=image_size.x || gl_GlobalInvocationID.y>=image_size.y)
+        return;
+
     vec2 texel_coord = vec2(gl_GlobalInvocationID.xy);
     float aspect_ratio = float(image_size.x)/float(image_size.y);
 
     float px = (2.0*((texel_coord.x+0.5)/image_size.x)-1.0) * data.fov_tan * aspect_ratio;
     float py = (1.0-2.0*((texel_coord.y+0.5)/image_size.y)) * data.fov_tan;
 
-    vec4 ray_origin = vec4(0.0,0.0,0.0,1.0) * data.cam;
-    vec4 ray_dir = normalize(vec4(px,py,-1.0,0.0)) * data.cam;
+    vec4 ray_origin =  data.cam * vec4(0.0,0.0,0.0,1.0);
+    vec4 ray_dir =  data.cam * normalize(vec4(px,py,-1.0,0.0));
     ray_dir = normalize(ray_dir);
     
+    debugPrintfEXT("%d,%d", image_size.x, image_size.y);
     vec4 color = render(ray_origin,ray_dir);
 
     imageStore(image, ivec2(gl_GlobalInvocationID.xy), color);
