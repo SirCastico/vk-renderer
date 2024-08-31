@@ -16,7 +16,7 @@ struct AABB{
 
 struct MeshData{
     AABB aabb;
-    uint inds_start_i, len;
+    uint inds_start_i, len, vert_offset;
 };
 
 struct Vertex{
@@ -117,18 +117,19 @@ vec4 render(vec4 origin, vec4 dir){
                 uint ind2 = data.mesh_data_ref.indices[v_ind+2];
 
                 Triangle tri = {
-                    data.mesh_data_ref.verts_ref.vertices[ind0],
-                    data.mesh_data_ref.verts_ref.vertices[ind1],
-                    data.mesh_data_ref.verts_ref.vertices[ind2],
+                    data.mesh_data_ref.verts_ref.vertices[ind0 + mesh_data.vert_offset],
+                    data.mesh_data_ref.verts_ref.vertices[ind1 + mesh_data.vert_offset],
+                    data.mesh_data_ref.verts_ref.vertices[ind2 + mesh_data.vert_offset],
                 };
 
                 //if(gl_WorkGroupID.xy == ivec2(123,42))
-                //    debugPrintfEXT("%u:%u", mesh_i,v_ind);
+                //    debugPrintfEXT("%u:%u:%u:%u", mesh_i,v_ind,mesh_data.inds_start_i,mesh_data.len);
 
                 //if(gl_WorkGroupID.xy == ivec2(99,54) && mesh_i==0)
 
                 //if(mesh_i==1)
                 //    debugPrintfEXT("%u:%u", mesh_i,v_ind);
+                //  debugPrintfEXT("%u:%u:%u:%u", mesh_i,v_ind,mesh_data.inds_start_i,mesh_data.len);
 
                 vec3 isect_pos;
                 if(ray_triangle_intersect(origin.xyz, dir.xyz, tri, isect_pos)){

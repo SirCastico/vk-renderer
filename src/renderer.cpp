@@ -557,7 +557,7 @@ namespace vkutils{
 
     struct MeshData{
         AABB aabb;
-        uint32_t ind_start_ind, ind_len;
+        uint32_t ind_start_ind, ind_len, vertex_offset;
     };
 
     struct Scene{
@@ -716,6 +716,7 @@ namespace vkutils{
 
         HMM_Vec3 *staging_vp = (HMM_Vec3*)((char*)staging_p+vertex_data_offset);
         uint64_t staging_vp_ind = 0, mesh_data_ind=0;
+        uint64_t current_vert_offset = 0;
         for(size_t mesh_i=0;mesh_i<data->meshes_count;++mesh_i){
             cgltf_mesh *mesh = &data->meshes[mesh_i];
 
@@ -753,6 +754,8 @@ namespace vkutils{
                     }
                 }
                 mesh_data[mesh_data_ind].aabb = aabb;
+                mesh_data[mesh_data_ind].vertex_offset = current_vert_offset;
+                current_vert_offset = staging_vp_ind;
                 mesh_data_ind++;
             }
         }
@@ -1112,7 +1115,7 @@ struct RenderContext{
         if(err!=VK_SUCCESS)abort_msg("failed to begin init cmd buf");
 
         vkutils::BufferBAlloc staging_allocator{};
-        vkutils::Scene scene = vkutils::read_gltf_meshes(vkb_device, dev_mem, init_cmd_buf, staging_allocator, "models/test.glb");
+        vkutils::Scene scene = vkutils::read_gltf_meshes(vkb_device, dev_mem, init_cmd_buf, staging_allocator, "models/test-sq-sphere.glb");
         
         vkEndCommandBuffer(init_cmd_buf);
 
