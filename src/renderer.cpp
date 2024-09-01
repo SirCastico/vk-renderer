@@ -556,6 +556,7 @@ namespace vkutils{
     };
 
     struct MeshData{
+        HMM_Vec3 color;
         AABB aabb;
         uint32_t ind_start_ind, ind_len, vertex_offset;
     };
@@ -683,6 +684,7 @@ namespace vkutils{
         };
         VkDeviceAddress m_addr = vkGetBufferDeviceAddress(dev, &v_addr_info);
 
+        // mesh metadata
         std::memcpy(staging_p, &m_addr, sizeof(m_addr));
         std::memcpy((char*)staging_p+sizeof(m_addr), &ind_count, sizeof(ind_count));
 
@@ -694,7 +696,15 @@ namespace vkutils{
             for(size_t prim_i=0;prim_i<mesh->primitives_count;++prim_i){
                 cgltf_primitive *prim = &mesh->primitives[prim_i];
 
+                HMM_Vec3 color = {1.0,1.0,1.0};
+                if(prim->material!=nullptr && prim->material->has_pbr_metallic_roughness){
+                    float (*v)[4] = &prim->material->pbr_metallic_roughness.base_color_factor;
+                    color[0] = (*v)[0];
+                    color[1] = (*v)[1];
+                    color[2] = (*v)[2];
+                }
                 mesh_data.push_back(MeshData{
+                    .color = color,
                     .ind_start_ind = (uint32_t)staging_ip_ind,
                     .ind_len = (uint32_t)prim->indices->count,
                 });

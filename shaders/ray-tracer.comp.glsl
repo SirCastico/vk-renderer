@@ -15,6 +15,7 @@ struct AABB{
 };
 
 struct MeshData{
+    vec3 color;
     AABB aabb;
     uint inds_start_i, len, vert_offset;
 };
@@ -106,10 +107,25 @@ bool ray_triangle_intersect(vec3 origin, vec3 dir, Triangle tri, out vec3 isect_
         return false;
 }
 
+
+#define FLT_MAX 3.402823466e+38
+#define FLT_MIN 1.175494351e-38
+#define DBL_MAX 1.7976931348623158e+308
+#define DBL_MIN 2.2250738585072014e-308
+
+float length_squared_vec3(vec3 v){
+    return v.x*v.x + v.y*v.y + v.z*v.z;
+}
+
 vec4 render(vec4 origin, vec4 dir){
-    vec4 color = vec4(0.0,0.0,1.0,1.0);
+    vec4 color = vec4(0.0,0.0,0.0,1.0);
+    float current_len_sq = FLT_MAX;
+    int current_mesh = -1;
+
     for(uint mesh_i=0;mesh_i<data.mesh_metadata_ref.size;++mesh_i){
         MeshData mesh_data = data.mesh_metadata_ref.meshes[mesh_i];
+        debugPrintfEXT("%f,%f,%f", mesh_data.color.r, mesh_data.color.g, mesh_data.color.b);
+
         if(ray_aabb_collision(mesh_data.aabb, origin, dir)){
             for(uint v_ind=mesh_data.inds_start_i;v_ind<mesh_data.inds_start_i+mesh_data.len;v_ind+=3){
                 uint ind0 = data.mesh_data_ref.indices[v_ind];
@@ -122,24 +138,22 @@ vec4 render(vec4 origin, vec4 dir){
                     data.mesh_data_ref.verts_ref.vertices[ind2 + mesh_data.vert_offset],
                 };
 
-                //if(gl_WorkGroupID.xy == ivec2(123,42))
-                //    debugPrintfEXT("%u:%u:%u:%u", mesh_i,v_ind,mesh_data.inds_start_i,mesh_data.len);
-
-                //if(gl_WorkGroupID.xy == ivec2(99,54) && mesh_i==0)
-
-                //if(mesh_i==1)
-                //    debugPrintfEXT("%u:%u", mesh_i,v_ind);
-                //  debugPrintfEXT("%u:%u:%u:%u", mesh_i,v_ind,mesh_data.inds_start_i,mesh_data.len);
-
                 vec3 isect_pos;
                 if(ray_triangle_intersect(origin.xyz, dir.xyz, tri, isect_pos)){
-                    if(mesh_i==1)
-                        debugPrintfEXT("i");
-                    return vec4(1.0,0.0,0.0,1.0);
+                    vec3 origin_isect_vec = isect_pos - origin.xyz;
+                    float len = length_squared_vec3(origin_isect_vec);
+                    if(len < current_len_sq) {
+                        current_len_sq = len;
+                        current_mesh = int(mesh_i);
+                    }
                 }
             }
         }
     }
+
+    if(current_mesh>=0)
+        color = vec4(data.mesh_metadata_ref.meshes[current_mesh].color,1.0);
+
     return color;
 }
 
