@@ -1125,7 +1125,7 @@ struct RenderContext{
         if(err!=VK_SUCCESS)abort_msg("failed to begin init cmd buf");
 
         vkutils::BufferBAlloc staging_allocator{};
-        vkutils::Scene scene = vkutils::read_gltf_meshes(vkb_device, dev_mem, init_cmd_buf, staging_allocator, "models/test-sq-sphere.glb");
+        vkutils::Scene scene = vkutils::read_gltf_meshes(vkb_device, dev_mem, init_cmd_buf, staging_allocator, "models/test2.glb");
         
         vkEndCommandBuffer(init_cmd_buf);
 
